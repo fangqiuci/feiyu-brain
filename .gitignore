@@ -1,0 +1,7 @@
+state/
+data/
+node_modules/
+node-path.txt
+*.local.json
+.env
+*.tgz
