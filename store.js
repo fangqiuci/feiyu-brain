@@ -102,10 +102,23 @@ export function listBrains() {
 }
 
 export function loadBrain(id) {
-  return readJson(brainFile(id), null);
+  const file = brainFile(id);
+  const main = readJson(file, null);
+  if (main) return main;
+  // 主文件坏了就退到备份——评审说得对，单文件损坏不该等于丢档
+  const bak = readJson(`${file}.bak`, null);
+  if (bak) {
+    try { writeJsonAtomic(file, bak); } catch { /* 修不回来也不影响这次读 */ }
+    return bak;
+  }
+  return null;
 }
 
 export function saveBrain(brain) {
-  writeJsonAtomic(brainFile(brain.id), brain);
+  const file = brainFile(brain.id);
+  try {
+    if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
+  } catch { /* 备份失败不影响写入 */ }
+  writeJsonAtomic(file, brain);
   return brain;
 }

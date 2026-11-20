@@ -4,17 +4,21 @@
 // 核心：忘了就是真的没有（不是"想不起来"）。
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
-export const TTL_DAYS = { episode: 30, impression: 90, imagination: 30, fact: Infinity, taste: Infinity };
+export const TTL_DAYS = { episode: 30, impression: 90, imagination: 30, card: 30, fact: Infinity, taste: Infinity };
 export const PROMOTE_DAYS = 15;
 export const RETRIEVE_BUDGET_CHARS = 900; // ≈800 token（中文约 1.1~1.3 字/token）
+export const CARD_THRESHOLD_CHARS = 6000;  // 上下文超过这个数就该压卡片
+export const CARD_MAX_CHARS = 160;
 
 export function emptyMemory() {
   return {
     facts: {},        // key → { text, kind:'fact', weight, lastRecall, consecutiveDays, longTerm }
     taste: {},        // key → score（她的口味：解压 0.9 / 带货 -0.8）
     impressions: {},  // name → { traits:[], count, lastAt, kind:'impression', ... }
+    apps: {},         // 平台记忆：douyin / bilibili / wechat / qq / … 各一桶
     episodes: [],     // { id, at, who, what, feel, outcome, context, strategy, kind:'episode' }
     imagination: [],  // 幻想：永不进 episodes（I6）
+    cards: [],        // 记忆卡片：上下文过长时的中段锚点
     formerSelves: [], // 蜕下来的皮
     forgotten: [],    // 真的忘了
     pending: [],      // 想说没说的
@@ -53,6 +57,61 @@ export function addImagination(memory, thought, now = Date.now()) {
 }
 
 /**
+ * 上下文过长时，把最旧的那段压成一张卡片。
+ *
+ * 卡片 = { 时间, 在场的人, 聊了什么, 她什么感受, 没说完的事 }，≈160 字。
+ * 原文可以裁掉，卡片留在上下文里——**长对话不爆靠的是压缩，不是截断**。
+ */
+export function shouldCompact(chars, { threshold = CARD_THRESHOLD_CHARS } = {}) {
+  return Number(chars) > threshold;
+}
+
+export function makeCard(episodes = [], { maxChars = CARD_MAX_CHARS, now = Date.now() } = {}) {
+  const list = episodes.filter(Boolean).slice(-12);
+  if (!list.length) return null;
+
+  const who = [...new Set(list.map((e) => e.who).filter(Boolean))].slice(0, 3);
+  const feels = [...new Set(list.map((e) => e.feel).filter(Boolean))].slice(0, 2);
+  const topics = list.map((e) => String(e.what ?? '').trim()).filter(Boolean);
+
+  const summary = [];
+  if (who.length) summary.push(`跟${who.join('、')}`);
+  if (topics.length) {
+    const head = topics[0].slice(0, 24);
+    const tail = topics.length > 1 ? topics[topics.length - 1].slice(0, 24) : '';
+    summary.push(tail ? `聊了「${head}」到「${tail}」` : `聊了「${head}」`);
+  }
+  if (feels.length) summary.push(`我当时${feels.join('、')}`);
+
+  const open = list.filter((e) => e.open).map((e) => String(e.what).slice(0, 20));
+  if (open.length) summary.push(`还没说完：${open.slice(0, 2).join('、')}`);
+
+  const text = summary.join('，').slice(0, maxChars);
+  return {
+    id: `card_${now}`,
+    kind: 'card',
+    at: now,
+    lastRecall: now,
+    consecutiveDays: 1,
+    longTerm: false,
+    from: list.map((e) => e.id).filter(Boolean),
+    who,
+    text,
+    chars: text.length,
+  };
+}
+
+/** 把卡片塞进记忆（同名去重，最多留 30 张） */
+export function addCard(memory, card) {
+  if (!card) return null;
+  const dup = memory.cards.find((c) => c.text === card.text);
+  if (dup) return dup;
+  memory.cards.push(card);
+  if (memory.cards.length > 30) memory.cards.splice(0, memory.cards.length - 30);
+  return card;
+}
+
+/**
  * 被提起一次：续命。
  * 同一天内多次提起不重复计数（按自然日算"连续天数"）。
  */
@@ -86,6 +145,10 @@ export function settle(memory, now = Date.now()) {
   const keepI = [];
   for (const i of memory.imagination) (expired(i) ? memory.forgotten : keepI).push(i);
   memory.imagination = keepI;
+
+  const keepC = [];
+  for (const c of memory.cards ?? []) (expired(c) ? memory.forgotten : keepC).push(c);
+  memory.cards = keepC;
 
   for (const bucket of ['facts', 'impressions']) {
     const src = memory[bucket] ?? {};
@@ -121,7 +184,24 @@ export function retrieve(cue, memory, { budget = RETRIEVE_BUDGET_CHARS, now = Da
     used += t.length;
   };
 
-  const { who = '', words = [], mood = null } = cue ?? {};
+  const { who = '', words = [], mood = null, withCards = true, app = null } = cue ?? {};
+
+  // ⓪ 平台记忆：她在那个 App 里刷过什么、爱看什么、上次停在哪
+  if (app && memory.apps?.[app]) {
+    const b = memory.apps[app];
+    const fav = Object.entries(b.taste ?? {}).sort((a, z) => z[1] - a[1])[0];
+    if (fav) push(`在${app}上我比较爱看${fav[0]}`, 'app');
+    if (b.lastLeft?.item) push(`上次在${app}停在「${b.lastLeft.item}」`, 'app');
+    for (const it of (b.seen ?? []).slice(-2)) {
+      if (it.title) push(`在${app}刷到过「${it.title}」`, 'app');
+    }
+  }
+
+  // ⓪ 卡片：上下文压过之后留下的大意，优先于细枝末节
+  if (withCards && Array.isArray(memory.cards) && memory.cards.length) {
+    const latest = memory.cards.slice(-2);
+    for (const c of latest) push(`（之前）${c.text}`, 'card', c.id);
+  }
 
   // ① 人：这人是谁 + 跟他的最近三次
   if (who) {

@@ -59,13 +59,13 @@ t('仍然 re-export 了库 API（两种用法共用一个包）', () => {
 
 mod.apply(ctx, { brainId: 'dsh', dataDir: tmp, roleDir: roles });
 
-t('注册了 4 个工具', () => {
-  if (tools.length !== 4) throw new Error(`实际 ${tools.length} 个：${tools.map((x) => x.name).join(',')}`);
+t('注册了 6 个工具', () => {
+  if (tools.length !== 6) throw new Error(`实际 ${tools.length} 个：${tools.map((x) => x.name).join(',')}`);
 });
 
 t('工具名符合约定', () => {
   const names = tools.map((x) => x.name).sort().join(',');
-  const want = ['feiyu_observe', 'feiyu_status', 'feiyu_tick', 'feiyu_wake'].join(',');
+  const want = ['feiyu_app', 'feiyu_feel', 'feiyu_observe', 'feiyu_status', 'feiyu_tick', 'feiyu_wake'].join(',');
   if (names !== want) throw new Error(names);
 });
 
@@ -118,6 +118,29 @@ await ta('没有角色卡时给的是人话，不是堆栈', async () => {
   const out = await st.execute({});
   if (out.ok !== false) throw new Error('找不到卡竟然成功了');
   if (!/角色卡|roleDir|current-role/.test(out.text)) throw new Error(`提示没有可操作性：${out.text}`);
+});
+
+await ta('feiyu_feel 能产出感受（词表空时是"说不清"）', async () => {
+  const r = await byName.feiyu_feel.execute({ valence: -0.6, intensity: 0.5 });
+  if (!r.ok) throw new Error(r.text);
+  if (!Array.isArray(r.pad) || r.pad.length !== 3) throw new Error('没有 PAD');
+  if (r.stage !== 1) throw new Error(`刚出生应该是阶段一，实际 ${r.stage}`);
+});
+
+await ta('feiyu_app 要么真的做了并留证据，要么明说没设备', async () => {
+  const r = await byName.feiyu_app.execute({ action: 'screenshot' });
+  if (r.ok === true) {
+    // 电脑上截屏是真能成的——那就必须真有证据文件
+    if (!/证据：\S+/.test(r.text)) throw new Error(`成功了却没给证据：${r.text}`);
+  } else {
+    if (!['E_NO_DEVICE', 'E_DRIVER', 'E_SCREENSHOT'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
+  }
+});
+
+await ta('feiyu_app 卸载要过闸门', async () => {
+  const r = await byName.feiyu_app.execute({ action: 'uninstall', package: 'com.x' });
+  if (r.ok !== false) throw new Error('竟然删了');
+  if (!['E_NOT_YET', 'Q1', 'E_NO_DEVICE'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
 });
 
 console.log('');

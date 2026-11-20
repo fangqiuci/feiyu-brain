@@ -9,17 +9,22 @@
  * 这不是"设定"，是"词典"——用来读人设卡，不是用来规定她。
  */
 export const TRAIT_LEXICON = {
-  嘴硬: ['傲娇', '嘴硬', '毒舌', '顶回去', '怼', '不服软', '嘴不饶人'],
-  心软: ['心软', '温柔', '在意', '心疼', '放下傲娇', '认真接一句'],
-  好奇: ['好奇', '有意思', '新鲜', '好玩', '感兴趣'],
-  好动: ['好动', '闲不住', '主动', '活跃', '动起来'],
-  敏感: ['敏感', '察觉', '细腻', '注意到'],
-  固执: ['固执', '倔', '不认', '坚持'],
-  自信: ['自信', '实力', '靠谱', '不含糊'],
-  爱反思: ['反思', '琢磨', '想过', '回头看'],
-  理性: ['理性', '逻辑', '判断', '正事'],
-  社交: ['黏人', '找人', '陪聊', '社交', '熟人'],
+  嘴硬: ['傲娇', '嘴硬', '毒舌', '顶回去', '怼', '不服软', '嘴不饶人', '嘴炮', '不认错', '伶牙俐齿'],
+  心软: ['心软', '温柔', '在意', '心疼', '放下傲娇', '认真接一句', '软了', '舍不得', '护着'],
+  好奇: ['好奇', '有意思', '新鲜', '好玩', '感兴趣', '想看看', '新鲜感', '什么都想'],
+  好动: ['好动', '闲不住', '主动', '活跃', '动起来', '坐不住', '折腾', '跑来跑去'],
+  敏感: ['敏感', '察觉', '细腻', '注意到', '放在心上', '记着', '被戳'],
+  固执: ['固执', '倔', '不认', '坚持', '一根筋', '改不了', '认死理'],
+  自信: ['自信', '实力', '靠谱', '不含糊', '有把握', '我说了算'],
+  爱反思: ['反思', '琢磨', '想过', '回头看', '复盘', '反省'],
+  理性: ['理性', '逻辑', '判断', '正事', '分析', '讲道理'],
+  社交: ['黏人', '找人', '陪聊', '社交', '熟人', '热闹', '凑过去', '搭话'],
+  活泼: ['活泼', '元气', '开心', '高兴', '爱笑', '欢喜', '闹'],
+  懒: ['懒', '懒得', '不想动', '躺', '摆烂', '摸鱼'],
 };
+
+/** 角色卡里可以直接写：`性格：嘴硬=0.9 心软=0.6` —— 手写覆盖自动统计 */
+const HINT_RE = /^(?:性格|特质|traits)\s*[:：]\s*(.+)$/im;
 
 /** 压缩指数：让"出现最多的特质"不至于把其余全部压到地板。
  *  1.0 = 原始比例（很极端）；0.7 = 感知上更接近"人都有一点"。 */
@@ -54,6 +59,24 @@ export function extractTraits(cardText) {
     traits[trait] = Math.max(0.15, Math.min(1, scaled));
   }
   return traits;
+}
+
+/**
+ * 手写覆盖：卡里写一行 `性格：嘴硬=0.9 心软=0.6`，就按这个来。
+ * 用来治"自动统计抽不准"——人比算法更知道她是啥样。
+ */
+export function applyTraitHints(traits = {}, cardText = '') {
+  const m = HINT_RE.exec(String(cardText));
+  if (!m) return traits;
+  const out = { ...traits };
+  for (const part of m[1].split(/[,，\s]+/).filter(Boolean)) {
+    const [k, v] = part.split(/[=:：]/);
+    const name = String(k ?? '').trim();
+    const num = Number(String(v ?? '').trim());
+    if (!name || !Number.isFinite(num)) continue;
+    out[name] = Math.max(0, Math.min(1, num));
+  }
+  return out;
 }
 
 const SKIP_SECTIONS = [/^六、/, /^七、/]; // 六：AI 味黑名单；七：回复示例
@@ -96,6 +119,8 @@ export function extractUnits(cardText, { max = 200 } = {}) {
     if (t.length < 5 || t.length > 140) return;
     if (/^(例如|比如|例子)/.test(t)) return;
     if (META_RE.test(t)) return;
+    // `性格：嘴硬=0.9` 是给解析器的指令，不是她的一条人格
+    if (/^(?:性格|特质|traits)\s*[:：]/i.test(t)) return;
     if (units.length >= max) return;
     units.push({
       id: `u${String(units.length + 1).padStart(3, '0')}`,
@@ -159,9 +184,11 @@ export function extractUnits(cardText, { max = 200 } = {}) {
  * 一条鱼从一张人设卡出生。
  * 同一张卡 → 同一组 units（确定性，可回放）。
  */
-export function birthFromCard(cardText) {
+export function birthFromCard(cardText, { traitsOverride = null } = {}) {
+  const auto = extractTraits(cardText);
+  const hinted = applyTraitHints(auto, cardText);
   return {
-    traits: extractTraits(cardText),
+    traits: { ...hinted, ...(traitsOverride ?? {}) },
     units: extractUnits(cardText),
   };
 }

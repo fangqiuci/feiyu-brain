@@ -100,17 +100,20 @@ export function brief(units, { maxChars = BRIEF_MAX_CHARS } = {}) {
  *
  * consistent  与这些命题一致  → +0.01
  * conflicting 与这些命题冲突  → −0.01
+ * step        幅度倍率（默认 1）。**只有重大转折才允许 >1**——平时必须是 1，
+ *             否则"不知不觉"就没了。上限 5。
  *
  * identity 永不调整（I2）。
  */
-export function evolve(units, { consistent = [], conflicting = [], at = 0 } = {}) {
+export function evolve(units, { consistent = [], conflicting = [], at = 0, step = 1 } = {}) {
   const ok = new Set(consistent);
   const bad = new Set(conflicting);
+  const k = Math.max(0, Math.min(5, Number(step) || 1));
   return units.map((u) => {
     if (u.kind === 'identity') return u;
     let w = u.weight;
-    if (ok.has(u.id)) w = clamp01(w + WEIGHT_STEP);
-    else if (bad.has(u.id)) w = clamp01(w - WEIGHT_STEP);
+    if (ok.has(u.id)) w = clamp01(w + WEIGHT_STEP * k);
+    else if (bad.has(u.id)) w = clamp01(w - WEIGHT_STEP * k);
     if (w === u.weight) return u;
     return { ...u, weight: w, lastTouched: at };
   });
