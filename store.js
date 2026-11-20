@@ -65,7 +65,9 @@ export function ensureDir(dir) {
 export function readJson(file, fallback = null) {
   try {
     if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Windows 记事本默认写 BOM，JSON.parse 会直接炸——先剥掉
+    const text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+    return JSON.parse(text);
   } catch {
     return fallback;
   }

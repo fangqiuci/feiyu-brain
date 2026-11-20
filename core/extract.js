@@ -155,7 +155,11 @@ export function extractUnits(cardText, { max = 200 } = {}) {
     if (bullet) text = bullet[1];
     else if (numbered) text = numbered[1];
     else if (quote) text = quote[1];
-    else if (!line.startsWith('#') && line.length >= 8) text = line; // 散文段落也是命题
+    else if (!line.startsWith('#')) {
+      // 普通段落也算命题；但太短的行多半是标题或噪音。
+      // 例外：以"你是/我叫/本体是"开头的短句就是身份，不能因为短就丢。
+      if (line.length >= 8 || IDENTITY_RE.test(line)) text = line;
+    }
     if (!text) continue;
 
     // 「你不要：xxx」这种是反例，不是她

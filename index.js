@@ -58,7 +58,9 @@ export function resolveRoleCard(roleName) {
   if (!name) {
     try {
       const stateFile = path.join(dataDir(), 'current-role.json');
-      name = JSON.parse(fs.readFileSync(stateFile, 'utf8')).role;
+      // 记事本会写 BOM，先剥掉再解析
+      const raw = fs.readFileSync(stateFile, 'utf8').replace(/^\uFEFF/, '');
+      name = JSON.parse(raw).role;
     } catch {
       name = null;
     }
@@ -66,7 +68,7 @@ export function resolveRoleCard(roleName) {
   if (!name) return null;
   const file = path.join(roleDir(), `${name}.md`);
   if (!fs.existsSync(file)) return null;
-  return { name, file, text: fs.readFileSync(file, 'utf8') };
+  return { name, file, text: fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '') };
 }
 
 function refreshBrief(brain) {
@@ -389,8 +391,9 @@ export function tryBody(id = DEFAULT_ID, action = {}) {
  *   累垮的鱼 → 掌控感低 → 靠近"委屈"
  *
  * @param {object} event { valence:-1~1, intensity:0~1, what?, who? }
+ * @param {object} [opts] { blend=0.65 } 新情绪占多少，剩下的是余温
  */
-export function feel(id = DEFAULT_ID, event = {}) {
+export function feel(id = DEFAULT_ID, event = {}, { blend = 0.65 } = {}) {
   const brain = ensureBrain(id);
   const r = emotion.feel({
     event,
@@ -399,15 +402,28 @@ export function feel(id = DEFAULT_ID, event = {}) {
     vocab: brain.vocab,
   });
 
-  brain.affect = {
-    p: r.pad[0],
-    a: r.pad[1],
-    d: r.pad[2],
-    mood: r.label.kind === 'word' ? r.label.word : (r.label.kind === 'variant' ? `${r.label.word}（变体）` : '说不上来'),
+  // 情绪有余温：新感受占 65%，上一次剩 35%。
+  // 否则每件事都把心情冲成新的，人会像开关而不是像有情绪惯性的活物。
+  const k = Math.max(0, Math.min(1, Number(blend)));
+  const prev = brain.affect ?? {};
+  const mix = (next, before) => {
+    const old = Number(before);
+    const base = Number.isFinite(old) ? old : 0;
+    return Number((next * k + base * (1 - k)).toFixed(4));
   };
-  brain.meta.lastFeel = { at: Date.now(), pad: r.pad, label: r.label, stage: r.stage, text: r.text };
+
+  brain.affect = {
+    p: mix(r.pad[0], prev.p),
+    a: mix(r.pad[1], prev.a),
+    d: mix(r.pad[2], prev.d),
+    // 名字按**这次**的感受叫：旧的余温不该拖住命名
+    mood: r.label.kind === 'word' ? r.label.word : (r.label.kind === 'variant' ? `${r.label.word}（变体）` : '说不上来'),
+    // 余温多少，方便调试时看"她还没缓过来"
+    carryover: Number((1 - k).toFixed(2)),
+  };
+  brain.meta.lastFeel = { at: Date.now(), pad: r.pad, blended: [brain.affect.p, brain.affect.a, brain.affect.d], label: r.label, stage: r.stage, text: r.text };
   saveBrain(brain);
-  return r;
+  return { ...r, blended: [brain.affect.p, brain.affect.a, brain.affect.d] };
 }
 
 /**
