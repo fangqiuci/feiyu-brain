@@ -13,9 +13,10 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const OUT = path.join(path.dirname(HERE), 'feiyu-brain-upload');
 
-const FOLDERS = ['core', 'adapters', 'docs', 'examples', 'market', 'scripts'];
+const FOLDERS = ['core', 'adapters', 'lib', 'docs', 'examples', 'market', 'scripts'];
 const FILES = [
   '.gitignore',
+  'cordis.patch.yml',
   'index.js',
   'store.js',
   'cli.mjs',

@@ -1,7 +1,7 @@
 {
   "name": "feiyu-brain",
-  "version": "1.1.1",
-  "description": "大肥鱼的大脑内核：人设是根，情绪/记忆/意识流/归因都是从人设长出来的。平台无关。",
+  "version": "1.2.0",
+  "description": "大肥鱼的大脑内核：人设是根，情绪/记忆/意识流/归因都是从人设长出来的。DSH 插件 + 平台无关库。",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -15,9 +15,10 @@
   "engines": {
     "node": ">=20"
   },
-  "main": "./index.js",
+  "main": "./lib/dsh-plugin.mjs",
   "exports": {
-    ".": "./index.js",
+    ".": "./lib/dsh-plugin.mjs",
+    "./lib": "./lib/dsh-plugin.mjs",
     "./adapters": "./adapters/index.js",
     "./adapters/qq-bridge": "./adapters/qq-bridge.js",
     "./adapters/tencent-official": "./adapters/tencent-official.js",
@@ -33,14 +34,21 @@
     "cli.mjs",
     "demo.mjs",
     "selftest.mjs",
+    "cordis.patch.yml",
     "core/",
     "adapters/",
+    "lib/",
     "docs/",
     "examples/",
     "market/",
     "README.md",
     "LICENSE"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "keywords": [
     "llm",
     "agent",

@@ -1,0 +1,19 @@
+# feiyu-brain 自带的挂载声明。
+#
+# entry 的 id 必须与包名一致（feiyu-brain），DSH 靠它把设置命名空间对上。
+#
+# 装法（二选一）：
+#   A. dsh plugin --profile desktop add feiyu-brain
+#      （把包加进 profile 的 dsh.profile.bundles，启动时装配）
+#   B. 手工在 profile 的 cordis.patch.yml 里加一条同 id 的 insert（热重载，不用重启）
+#   ⚠️ A 和 B 只能选一个，两条都写会出现重复 entry。
+
+- insert:
+    - id: feiyu-brain
+      name: feiyu-brain
+      config:
+        brainId: default
+        # 她的档案放哪（留空 = 包同级的 state/，或环境变量 FEIYU_DATA_DIR）
+        dataDir: ""
+        # 角色卡目录（里面放 <名字>.md；留空 = 包同级的 roles/，或 FEIYU_ROLE_DIR）
+        roleDir: ""
