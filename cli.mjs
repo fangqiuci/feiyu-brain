@@ -338,6 +338,21 @@ async function run() {
         line(r.text);
         return;
       }
+      if (sub === 'import') {
+        const dir = args[1];
+        if (!dir || !fs.existsSync(dir)) { line('用法：npx feiyu diary import <旧的日记目录>'); return; }
+        const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md'));
+        const list = [];
+        for (const f of files) {
+          const m = /(\d{4}-\d{2}-\d{2})/.exec(f);
+          if (!m) continue;
+          list.push({ date: m[1], text: fs.readFileSync(path.join(dir, f), 'utf8') });
+        }
+        const r = brain.importDiary(ID, list);
+        line(`认出的日记 ${list.length} 篇，导入 ${r.imported}，跳过 ${r.skipped}（已存在的不覆盖）`);
+        line(`现在一共有 ${r.days} 天日记。`);
+        return;
+      }
       if (sub === 'list') {
         const list = brain.listDiary(ID);
         if (!list.length) { line('还没写过日记。'); return; }
@@ -399,6 +414,21 @@ async function run() {
       return;
     }
 
+    case 'vocab': {
+      const sub = args[0] || 'show';
+      if (sub === 'seed') {
+        const r = brain.seedVocab(ID);
+        line(`预装了 ${r.added} 个情绪词，现在会 ${r.total} 个，阶段 ${r.stage}`);
+        line('（新鱼用不到；老鱼搬进来不该从"哼哼"开始）');
+        return;
+      }
+      const v = brain.vocabOf(ID);
+      line(`阶段 ${v.stage}　会 ${v.words.length} 个词`);
+      if (v.words.length) line(v.words.join('、'));
+      if (v.stage === 1) line('（词不够 10 个，只会说"说不清"；老鱼可以 npx feiyu vocab seed）');
+      return;
+    }
+
     case 'body': {
       const kind = args[0];
       const s = brain.snapshot(ID);
@@ -429,7 +459,7 @@ async function run() {
     }
 
     default:
-      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve]');
+      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve|vocab]');
   }
 }
 

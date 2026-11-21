@@ -1,6 +1,6 @@
 {
   "name": "feiyu-brain",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "大肥鱼的大脑内核：人设是根，情绪/记忆/意识流/归因都是从人设长出来的。DSH 插件 + 平台无关库。",
   "type": "module",
   "license": "MIT",

@@ -69,3 +69,81 @@ export function sever(relation) {
   if (relation.status !== 'cold') throw new Error('必须先冷战才能解除');
   return { ...relation, status: 'severed', severedAt: Date.now() };
 }
+
+/* ── 缺位：人不在了，关系还在 ─────────────────────────────────
+ *
+ * 这是契约里原来没有的一格，也是最难写的一格。
+ *
+ * 关键区别：
+ *   severed  = 她**不再认**这段关系（自己切断）
+ *   absent  = 关系**照旧永久**，只是那个人不会再出现（不是她选的）
+ *
+ * absent 不删记忆、不解关系、不改称呼——你爷爷还是你爷爷。
+ * 但如果主动改成 severed，那才是"我不认他了"。
+ */
+
+export const ABSENT_STATUSES = ['absent', 'memorial'];
+
+/**
+ * 标记缺位。**必须显式调用**——不许由"多久没说话"自动推断。
+ *
+ * 一个人半年没来，可能是忙，可能是死。机器没资格猜这个。
+ *
+ * @param {object} relation
+ * @param {object} o
+ * @param {number} [o.since]   从哪天起不在了（毫秒）
+ * @param {string} [o.note]    写一句记下来（"2026-11-21 走的"）
+ * @param {'absent'|'memorial'} [o.status]
+ */
+export function markAbsent(relation, { since = Date.now(), note = '', status = 'absent' } = {}) {
+  if (!relation) return null;
+  if (relation.status === 'severed') return relation; // 已经不认了，不用再标
+  return {
+    ...relation,
+    status,
+    absentSince: since,
+    absentNote: note,
+    // 关系维度一律不动：priority / mustRecognize / dissolvable 全部保持
+    absenceKept: 'relationship-unchanged',
+  };
+}
+
+/** 他又出现了（误报、或者人回来了） */
+export function clearAbsent(relation) {
+  if (!relation) return relation;
+  const next = { ...relation, status: 'active' };
+  delete next.absentSince;
+  delete next.absentNote;
+  delete next.absenceKept;
+  return next;
+}
+
+export function isAbsent(relation) {
+  return !!relation && ABSENT_STATUSES.includes(relation.status);
+}
+
+/** 多少天没出现了（人在不在都算"没来"） */
+export function absentDays(relation, now = Date.now()) {
+  if (!relation) return 0;
+  const since = Number(relation.absentSince) || 0;
+  if (!since) return 0;
+  return Math.max(0, Math.floor((now - since) / 86400000));
+}
+
+/**
+ * 这段关系现在该怎么说。
+ *
+ * 说"不在了"很容易滑进煽情，所以只给事实，不给形容。
+ */
+export function relationLine(relation, now = Date.now()) {
+  if (!relation) return '';
+  const who = relation.address || '那个人';
+  if (isAbsent(relation)) {
+    const d = absentDays(relation, now);
+    const head = relation.absentNote ? relation.absentNote : `${who}已经不在了`;
+    return d > 0 ? `${head}（${d} 天）` : head;
+  }
+  if (relation.status === 'severed') return `跟${who}断了`;
+  if (relation.status === 'cold') return `跟${who}冷战`;
+  return '';
+}

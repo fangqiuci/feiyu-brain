@@ -120,20 +120,107 @@ export function evolve(units, { consistent = [], conflicting = [], at = 0, step 
 }
 
 /**
- * 自然衰减：没被用到的命题会慢慢褪色。
- * 注意这是"时间"的衰减；被提起（evolve 命中）会把它拉回来。
+ * 自然衰减：**长期没人碰**的命题才会褪色。
+ *
+ * 不是"每天都掉一点"——那等于还没活就先老了。
+ * 一条命题最后一次被碰到（evolve 命中 / 被人聊到）之后，
+ * 超过 quietDays 天没人再碰，才开始按天衰减；一碰就停。
  */
-export function decay(units, days, at = 0) {
+export function decay(units, days, at = 0, { quietDays = 30 } = {}) {
   if (!(days > 0)) return units;
   const factor = Math.pow(DAILY_DECAY, days);
+  const quietMs = quietDays * 24 * 60 * 60 * 1000;
   return units.map((u) => {
     if (u.kind === 'identity') return u;
+    const since = at - (u.lastTouched ?? u.born ?? 0);
+    if (since <= quietMs) return u; // 还有人惦记，不掉
     const w = clamp01(u.weight * factor);
     if (w === u.weight) return u;
-    return { ...u, weight: w, lastTouched: at };
+    return { ...u, weight: w };
   });
 }
 
+/**
+ * 一年一度的蜕壳：把「这一年里掉出去的人设」打包成一张永久记忆卡片。
+ *
+ * 不是存整份快照——存的是**被忘掉的那部分**：
+ *   · 今年蜕下来的皮（formerSelves 里今年的）
+ *   · 现在还没掉到底、但已经明显变淡的（< 0.35）
+ *
+ * 这样她以后能说"我去年不是这样"，而不是只有一个当前版本。
+ */
+export function shellSummary(units, formerSelves, { year, at = 0, yearMoves = {} } = {}) {
+  const shedThisYear = (formerSelves ?? []).filter((f) => {
+    const y = new Date(f.shedAt ?? 0).getFullYear();
+    return !year || y === year;
+  });
+  const faded = (units ?? []).filter((u) => u.kind !== 'identity' && u.weight < 0.35);
+
+  // 这一年里掉得最多的几条（不用掉到底，只要"明显变了"）
+  const dropped = Object.entries(yearMoves ?? {})
+    .filter(([, d]) => Number(d) <= -0.05)
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, 6)
+    .map(([unitId, d]) => {
+      const u = (units ?? []).find((x) => x.id === unitId);
+      return u ? { text: u.text, delta: Number(d) } : null;
+    })
+    .filter(Boolean);
+
+  const bits = [];
+  for (const f of shedThisYear.slice(0, 6)) {
+    bits.push(`${String(f.memoir ?? f.text).slice(0, 24)}（掉了）`);
+  }
+  for (const d of dropped) {
+    if (bits.length >= 8) break;
+    bits.push(`${d.text.slice(0, 18)}（少了 ${Math.abs(d.delta).toFixed(2)}）`);
+  }
+  for (const u of faded.slice(0, 4)) {
+    if (bits.length >= 10) break;
+    bits.push(`${u.text.slice(0, 18)}（淡到 ${Number(u.weight).toFixed(2)}）`);
+  }
+
+  const head = `${year} 年的我`;
+  if (!bits.length) {
+    return { year, title: head, text: `${head}：这一年没什么大变化。`, changed: 0 };
+  }
+  return {
+    year,
+    title: head,
+    text: `${head}：${[...new Set(bits)].join('；')}。这些后来都不太像我了。`.slice(0, 300),
+    changed: shedThisYear.length + dropped.length + faded.length,
+  };
+}
+
+/**
+ * 「最近」——最近几天她哪一点更明显了。
+ *
+ * 每天 ±0.01 看不出来，但七天攒起来能说出来一句。
+ */
+export function recentShift(moves, units, { days = 7, at = 0, threshold = 0.02 } = {}) {
+  const since = at - days * 24 * 60 * 60 * 1000;
+  const acc = new Map();
+  for (const m of moves ?? []) {
+    if ((m.at ?? 0) < since) continue;
+    acc.set(m.id, (acc.get(m.id) ?? 0) + (Number(m.delta) || 0));
+  }
+  let best = null;
+  for (const [id, sum] of acc) {
+    if (Math.abs(sum) < threshold) continue;
+    if (!best || Math.abs(sum) > Math.abs(best.sum)) best = { id, sum };
+  }
+  if (!best) return null;
+  const unit = (units ?? []).find((u) => u.id === best.id);
+  if (!unit) return null;
+  return {
+    id: best.id,
+    delta: Number(best.sum.toFixed(3)),
+    text: unit.text.slice(0, 30),
+    line: best.sum > 0
+      ? `最近她「${unit.text.slice(0, 20)}」这一点比平时更明显`
+      : `最近她「${unit.text.slice(0, 20)}」这一点淡了些`,
+  };
+}
 /**
  * 蜕皮：权重掉到底的命题，降级成"我以前……"，进记忆，不再是人格。
  *

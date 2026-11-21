@@ -45,7 +45,8 @@ function countKeyword(text, words) {
 }
 
 /**
- * 从人设卡正文抽出 traits（0~1）。
+ * 从人设卡正文抽出 traits（0~1）——**已知的 12 个维度**。
+ * 这是"常见结果"的先验词表，不是封闭枚举；新维度由 extractOpenTraits 自己长。
  */
 export function extractTraits(cardText) {
   const raw = {};
@@ -61,6 +62,74 @@ export function extractTraits(cardText) {
   return traits;
 }
 
+/* ── 开放维度：她自己长出来的性格 ─────────────────────────────
+ *
+ * 12 个已知维度只是"常见说法"的词表，不是唯一答案。
+ * 卡里写"我这人特别较真""我有点社恐"，「较真」「社恐」不是词表里的，
+ * 但它们确实描述她——那就该成为维度。
+ *
+ * 抽取规则（确定性，不靠模型）：
+ *   ① 「很/有点/特别/太/超/挺/比较 + X」里的 X
+ *   ② 行首「我 + X，」里的 X
+ *   ③ 命中已知词表的归到已知维度，其余作为新维度
+ */
+
+const ADVERB_RE = /(?:很|有点|特别|太|超|挺|比较|蛮|相当)([\u4e00-\u9fa5]{2,3})/g;
+const SELF_RE = /我(?:这人|这个人|嘛|呢)?([\u4e00-\u9fa5]{2,3})(?=[，,。；;]|\s|$)/g;
+
+/** 这些不是性格，是动作/虚词 */
+const NOT_TRAIT = new Set([
+  '觉得', '认为', '知道', '喜欢', '讨厌', '想要', '需要', '可以', '应该', '不会', '不要',
+  '就是', '还是', '也是', '不是', '有点', '一些', '什么', '这个', '那个', '一个', '时候',
+  '说话', '做事', '这样', '那样', '一样', '很多', '多少', '怎么', '为什么',
+]);
+
+/** 已被已知词表覆盖的说法，不再重复建维度 */
+function knownTraitOf(word) {
+  for (const [trait, words] of Object.entries(TRAIT_LEXICON)) {
+    if (trait === word) return trait;
+    if (words.some((w) => w === word || w.includes(word) || word.includes(w))) return trait;
+  }
+  return null;
+}
+
+/**
+ * 抽出「开放维度」——卡里出现、但不在 12 维词表里的性格词。
+ * @returns {Record<string, number>} 新维度 → 权重
+ */
+const ADVERBS = ['比较', '相当', '特别', '有点', '很', '太', '超', '挺', '蛮'];
+
+function stripAdverb(word) {
+  for (const a of ADVERBS) {
+    if (word.startsWith(a) && word.length > a.length + 1) return word.slice(a.length);
+  }
+  return word;
+}
+
+export function extractOpenTraits(cardText, { max = 8, known = null } = {}) {
+  const text = plainText(cardText);
+  const counts = new Map();
+
+  const add = (raw) => {
+    const word = stripAdverb(String(raw ?? '').trim());
+    if (!word || word.length < 2 || word.length > 4) return;
+    if (NOT_TRAIT.has(word)) return;
+    if (knownTraitOf(word)) return;          // 归到已知维度了，不重复
+    if (known && known[word] !== undefined) return;
+    counts.set(word, (counts.get(word) ?? 0) + 1);
+  };
+
+  for (const m of text.matchAll(ADVERB_RE)) add(m[1]);
+  for (const m of text.matchAll(SELF_RE)) add(m[1]);
+
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, max);
+  const maxN = Math.max(1, ...sorted.map(([, n]) => n));
+  const out = {};
+  for (const [word, n] of sorted) {
+    out[word] = Math.max(0.3, Math.min(1, Math.pow(n / maxN, TRAIT_CURVE)));
+  }
+  return out;
+}
 /**
  * 手写覆盖：卡里写一行 `性格：嘴硬=0.9 心软=0.6`，就按这个来。
  * 用来治"自动统计抽不准"——人比算法更知道她是啥样。
@@ -229,9 +298,13 @@ export function lintCard(cardText) {
  */
 export function birthFromCard(cardText, { traitsOverride = null } = {}) {
   const auto = extractTraits(cardText);
+  const open = extractOpenTraits(cardText, { known: auto });
   const hinted = applyTraitHints(auto, cardText);
   return {
-    traits: { ...hinted, ...(traitsOverride ?? {}) },
+    // 已知 12 维 + 她自己长出来的开放维度（同名时以手写覆盖为准）
+    traits: { ...auto, ...open, ...hinted, ...(traitsOverride ?? {}) },
+    knownTraits: auto,
+    openTraits: open,
     units: extractUnits(cardText),
   };
 }

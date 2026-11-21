@@ -10,12 +10,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { birthFromCard, lintCard } from './core/extract.js';
-import { brief, decay, evolve, shed, weightReport } from './core/persona.js';
+import { birthFromCard, lintCard, TRAIT_LEXICON } from './core/extract.js';
+import { brief, decay, evolve, shed, weightReport, shellSummary, recentShift } from './core/persona.js';
 import { styleVector, flowLevel, flowName, hashTraits, mulberry32 } from './core/derive.js';
 import { createBody, chooseBody, bodyLine, canDo, hasCapability, CAPABILITY, BODY_KINDS, BODY_PROFILES, recordAction } from './core/body.js';
-import { emptyMemory, addEpisode, addImagination, recall, settle, retrieve } from './core/memory.js';
-import { createContract } from './core/relation.js';
+import { emptyMemory, addEpisode, addImagination, recall, settle, retrieve, touchByIds, distillGists, distillUmbrellas, nameFaded, detectRepeat, markImportant, markImportantByTopic, isRepeatNoise, textSimilarity, IMPORTANT_REPEAT, IMPORTANT_WINDOW_DAYS } from './core/memory.js';
+import { addBond, bondDelta, bondOf, bondLine, decayBonds, bondSensitivity, markBondAbsent, clearBondAbsent, bondAbsentOf, ABSENT_MIN_TIER, BOND_TIERS, BOND_MAX } from './core/bond.js';
+import { learnConcept, conceptOf, conceptAnswer, conceptsIn, makeQuestion } from './core/concept.js';
+import { composeNarrative, narrativeChanged, NARRATIVE_MAX } from './core/self.js';
+import { createContract, markAbsent as markAbsentContract, clearAbsent as clearAbsentRelation, relationLine, isAbsent } from './core/relation.js';
 import { attribute, LABELS } from './core/attribution.js';
 import { check } from './core/invariants.js';
 import { toCue, toObservation, shouldObserve, normalizeEvent } from './core/event.js';
@@ -31,15 +34,20 @@ import {
 import {
   ROOT, loadBrain, saveBrain, appendAudit, readAudit, listBrains,
   setDataDir, setRoleDir, dataDir, roleDir, brainDir, dataDirSource, isDataDirInsidePackage,
+  setEpisodeWindow, episodeWindow, readYear, listYears,
 } from './store.js';
 
 const DEFAULT_ID = 'default';
 const cache = new Map();
 
 /* 全局开关（configure 改） */
-let shadowMode = false;        // 影子模式：只写 audit，不动权重、不落盘
+let shadowMode = false;        // 影子模式：算但不写人设，全记进 shadow.jsonl
 let ttlPolicy = 'hard';        // hard | summarize | archive | off
 let moodPolicy = 'brain';      // 情绪双源：brain（脑说了算）| host（宿主说了算）| blend（各一半）
+let compressDays = 21;         // 完整期：21 天没人提 → 压成卡片
+let forgetDays = 730;          // 卡片期：2 年没人提 → 遗忘
+let briefChars = 300;          // 「此刻的她」多长；老鱼可以调大
+let maxEpisodes = 5000;        // 脑里最多存多少条，超了最老的压卡片
 
 function nowMs() {
   return Date.now();
@@ -60,12 +68,33 @@ function logOnce(msg) {
  *   configure({ shadow: true })      影子模式：observe 只留审计，不动人设、不落盘
  *   configure({ ttlPolicy: 'off' })  hard(默认) | summarize(过期前压卡片) | off(永不遗忘)
  */
-export function configure({ dataDir: d, roleDir: r, shadow, ttl, mood } = {}) {
+/**
+ * 宿主初始化。
+ *
+ *   configure({ dataDir, roleDir })
+ *   configure({ shadow: true })           影子模式：算但不写人设，全记进 shadow.jsonl
+ *   configure({ ttlPolicy: 'off' })       hard(默认) | summarize | archive | off
+ *   configure({ moodPolicy: 'host' })     brain | host | blend
+ *   configure({ compressDays: 30 })       多少天没人提就压扁
+ *   configure({ forgetDays: 90 })         多少天没人提就遗忘
+ *   configure({ briefChars: 300 })        「此刻的她」多长（老鱼可以调到 600）
+ *   configure({ maxEpisodes: 5000 })      脑里最多存多少条
+ */
+export function configure({
+  dataDir: d, roleDir: r, shadow, ttl, mood,
+  compressDays: cd, forgetDays: fd, briefChars: bc, maxEpisodes: me,
+} = {}) {
   if (d) setDataDir(d);
   if (r) setRoleDir(r);
   if (typeof shadow === 'boolean') shadowMode = shadow;
   if (ttl && ['hard', 'summarize', 'archive', 'off'].includes(ttl)) ttlPolicy = ttl;
   if (mood && ['brain', 'host', 'blend'].includes(mood)) moodPolicy = mood;
+  if (Number.isFinite(cd) && cd > 0) compressDays = Math.floor(cd);
+  if (Number.isFinite(fd) && fd > compressDays) forgetDays = Math.floor(fd);
+  // 经历按年分片：打开时只加载 forgetDays 窗口内的年份（16 年也不会越读越慢）
+  setEpisodeWindow(forgetDays);
+  if (Number.isFinite(bc) && bc >= 100) briefChars = Math.floor(bc);
+  if (Number.isFinite(me) && me >= 100) maxEpisodes = Math.floor(me);
 }
 
 export function runtimeOptions() {
@@ -73,6 +102,10 @@ export function runtimeOptions() {
     shadow: shadowMode,
     ttlPolicy,
     moodPolicy,
+    compressDays,
+    forgetDays,
+    briefChars,
+    maxEpisodes,
     dataDir: dataDir(),
     dataDirSource: dataDirSource(),
     dataDirInsidePackage: isDataDirInsidePackage(),
@@ -136,7 +169,7 @@ export function resolveRoleCard(roleName) {
 }
 
 function refreshBrief(brain) {
-  brain.persona.brief = brief(brain.persona.units);
+  brain.persona.brief = brief(brain.persona.units, { maxChars: briefChars });
   return brain;
 }
 
@@ -171,7 +204,10 @@ export function birth({ id = DEFAULT_ID, relation = 'parent', address = '', card
     if (fs.existsSync(sidecar)) traitsOverride = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
   } catch { traitsOverride = null; }
 
-  const { traits, units } = birthFromCard(card.text, { traitsOverride });
+  const { traits, units, knownTraits, openTraits } = birthFromCard(card.text, { traitsOverride });
+  // 命题的"最后一次被碰到"从出生算起——不然一条新鱼第一天就开始褪色
+  const born = nowMs();
+  for (const u of units) { u.lastTouched = born; u.born = born; }
   const brain = {
     id,
     schema: 'brain/2',
@@ -180,8 +216,16 @@ export function birth({ id = DEFAULT_ID, relation = 'parent', address = '', card
     persona: {
       seed: cardName ? `card:${card.name}` : `${roleDir()}/${card.name}.md`,
       traits,
+      // 已知 12 维（先验）与她自己长出来的维度分开存，方便看"哪些是她的原话"
+      knownTraits: knownTraits ?? traits,
+      openTraits: openTraits ?? {},
       units,
       brief: '',
+      // 一年一度蜕壳：把这一年掉出去的人设打包成永久记忆卡片
+      shellYear: new Date(born).getFullYear(),
+      shellAt: born,
+      // 最近几天的权重变动，用来生成「最近」那一段
+      moves: [],
       // 人格主档只有一个：这里。外部卡只是"导入源"，导过就记下来。
       source: {
         kind: cardText ? 'inline' : 'file',
@@ -251,9 +295,9 @@ export function getBrief(id = DEFAULT_ID) {
  * sections 可选：persona / flow / body / mood / memory / search
  * budget 是**总字数上限**，超了就从低优先级的段开始砍（persona 保底不砍）。
  */
-export const WAKE_SECTIONS = ['persona', 'flow', 'body', 'mood', 'memory', 'search'];
+export const WAKE_SECTIONS = ['persona', 'self', 'relation', 'bond', 'concept', 'flow', 'body', 'mood', 'recent', 'memory', 'search'];
 /** 预算不够时的砍法：越靠后越先砍 */
-const WAKE_PRIORITY = ['persona', 'mood', 'flow', 'memory', 'body', 'search'];
+const WAKE_PRIORITY = ['persona', 'self', 'relation', 'concept', 'bond', 'mood', 'recent', 'flow', 'memory', 'body', 'search'];
 
 export function wakeLine(id = DEFAULT_ID, eventOrCue = null, opts = {}) {
   const brain = ensureBrain(id);
@@ -268,6 +312,26 @@ export function wakeLine(id = DEFAULT_ID, eventOrCue = null, opts = {}) {
   brain.state.flow = level;
 
   const seg = { persona: `【此刻的她】${brain.persona.brief}` };
+
+  // 「我是谁」——会跟着经历长的那一句
+  const nar = brain.self?.narrativeText ?? brain.self?.narrative;
+  if (nar) seg.self = `【我是谁】${nar}`;
+
+  // 缺位：那个人不在了。关系没断，但状态要说出来——
+  // 不写"想念"，只给事实，怎么感受由她的人设决定。
+  const relLine = relationLine(brain.relation);
+  if (relLine) seg.relation = `【他】${relLine}`;
+
+  // 恩情：除了主人，还有谁对她好过——这是她自己算的，不是标签
+  const bonded = Object.keys(brain.memory.bonds ?? {})
+    .filter((w) => w !== brain.relation?.address)
+    .map((w) => bondOf(brain.memory, w))
+    .filter((b) => b.tier !== 'stranger')
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 2);
+  if (bonded.length) {
+    seg.bond = `【他们】${bonded.map((b) => bondLine(brain.memory, b.who)).join('；')}`;
+  }
   if (level !== 1) seg.flow = `【意识流】${flowName(level)}`;
 
   const bodyText = bodyLine(brain.body);
@@ -283,9 +347,21 @@ export function wakeLine(id = DEFAULT_ID, eventOrCue = null, opts = {}) {
   }
 
   const cue = eventOrCue?.who !== undefined ? eventOrCue : toCue(eventOrCue);
+
+  // 概念：这次聊到的东西她到底懂不懂
+  const cs = conceptsIn(brain.memory, cue?.text ?? '');
+  if (cs.length) {
+    seg.concept = `【她懂的】${cs.map((c) => `${c.term}：${c.definition}${c.why ? `（${c.why}）` : ''}`).join('；')}`;
+  }
+
+  // 「最近」：每天 ±0.01 看不出来，七天攒起来就能说一句
+  const shift = recentShift(brain.persona.moves, brain.persona.units, { at: nowMs() });
+  if (shift) seg.recent = `【最近】${shift.line}`;
   if (cue) {
     const hit = retrieve(cue, brain.memory);
     if (hit.text) seg.memory = `【想到的】\n${hit.text}`;
+    // 「被想起来」也算提起：检索命中的记忆会续命，一直没人想起的才会老化
+    if (hit.items?.length) touchByIds(brain.memory, hit.items.map((i) => i.id), nowMs());
 
     // 外部检索器（向量/图谱）：同步读缓存，不 await
     if (extraRetriever) {
@@ -340,33 +416,58 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
   const conflicting = ev.conflicting ?? matchUnits(brain.persona.units, ev.text ?? '').conflicting;
 
   // ── 影子模式 ──
-  // 只写审计，不动人设、不进记忆、不落盘。
-  // 宿主可以拿它试跑一百次，确认"会长成什么样"，再决定要不要真接。
-  // 全局开关和这条鱼自己的标记都算数——生下来之后才打开 shadow 也应该生效。
+  // 算但不写：人设权重、记忆、brain.json 一个字不动。
+  // 但**不是空跑**——这一次的「本来会发生什么」全记进 shadow.jsonl，
+  // 跑一百轮之后能看见她会长成什么样，再决定要不要真接。
   if (shadowMode || brain.meta.shadow) {
     const would = brain.persona.units
       .filter((u) => consistent.includes(u.id) || conflicting.includes(u.id))
       .map((u) => ({
         id: u.id,
+        text: u.text.slice(0, 30),
         from: Number(u.weight.toFixed(3)),
         to: Number(Math.max(0, Math.min(1, u.weight + (consistent.includes(u.id) ? 1 : -1) * 0.01)).toFixed(3)),
       }));
-    appendAudit(id, {
-      kind: 'shadow',
-      shadow: true,
+
+    const entry = {
       at,
-      text: String(ev.text ?? ev.what ?? '').slice(0, 80),
+      text: String(ev.text ?? ev.what ?? '').slice(0, 100),
       wouldChange: would,
-    });
+      wouldRemember: String(ev.what ?? ev.text ?? '').slice(0, 80),
+      app: ev.app ?? null,
+    };
+    appendAudit(id, { kind: 'shadow', shadow: true, at, text: entry.text, wouldChange: would });
+    try {
+      fs.appendFileSync(path.join(brainDir(id), 'shadow.jsonl'), `${JSON.stringify(entry)}\n`, 'utf8');
+    } catch (e) {
+      logOnce(`[brain] shadow 写入失败（已忽略）：${e?.message ?? e}`);
+    }
     return {
-      brain, consistent, conflicting, label: null, shadow: true, evolved: false, remembered: false, wouldChange: would,
+      brain, consistent, conflicting, label: null, shadow: true, evolved: false, remembered: false, wouldChange: would, shadowFile: path.join(brainDir(id), 'shadow.jsonl'),
     };
   }
 
   // step：默认 1（每次 ±0.01）。只有传了 magnitude（重大转折）才放大，上限 5。
   const step = Math.max(1, Math.min(5, Number(ev.magnitude) || 1));
   if (doEvolve) {
+    const beforeW = new Map(brain.persona.units.map((u) => [u.id, u.weight]));
     brain.persona.units = evolve(brain.persona.units, { consistent, conflicting, at, step });
+
+    // 记下这次的变动，攒成「最近」
+    const moves = [];
+    for (const u of brain.persona.units) {
+      const b = beforeW.get(u.id);
+      if (b !== undefined && b !== u.weight) {
+        moves.push({ id: u.id, delta: Number((u.weight - b).toFixed(4)), at });
+      }
+    }
+    if (moves.length) {
+      brain.persona.moves = [...(brain.persona.moves ?? []), ...moves].slice(-300);
+      // 按年累计，供年底蜕壳时总结"这一年我变了什么"
+      const ym = brain.persona.yearMoves ?? {};
+      for (const m of moves) ym[m.id] = Number(((ym[m.id] ?? 0) + m.delta).toFixed(4));
+      brain.persona.yearMoves = ym;
+    }
 
     // 蜕皮
     const sh = shed(brain.persona.units, { at });
@@ -398,7 +499,9 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
     ? ev
     : (ev.text ? { who: ev.who ?? ev.sender ?? '', what: String(ev.text).slice(0, 80), feel: ev.feel ?? '', via: ev.via ?? 'api' } : null);
   if (doRemember && obs?.what) {
-    addEpisode(brain.memory, {
+    // 反复出现的事 → 重要记忆，永不压扁
+    const rep = detectRepeat(brain.memory, { who: obs.who ?? '', what: obs.what }, at);
+    const ep = addEpisode(brain.memory, {
       who: obs.who ?? '',
       what: obs.what,
       feel: ev.feel ?? '',
@@ -409,7 +512,14 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
       strategy: ev.action?.strategy ?? null,
       evidence: obs.via ?? 'chat',
       source: 'live',
+      ...(rep.important ? { important: true, longTerm: true, importantCount: rep.count, importantSample: rep.sample } : {}),
     }, at);
+    if (rep.important) {
+      // 追溯：之前提过的同话题也转重要，别让前两次被压成卡片
+      const back = markImportantByTopic(brain.memory, { who: obs.who ?? '', what: obs.what }, at);
+      appendAudit(id, { kind: 'important', count: rep.count, backfilled: back, what: String(obs.what).slice(0, 40) });
+      void ep;
+    }
   }
 
   if (doRemember && ev.action) {
@@ -454,6 +564,21 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
     im.lastAt = at;
     if (ev.feel) im.traits = [...new Set([...(im.traits ?? []), ev.feel])].slice(-6);
     brain.memory.impressions[who] = im;
+
+    // 恩情：谁对我好，是算出来的，不是写死的
+    //   care   = 真的照顾（充电、开窗、修我）base 8
+    //   普通互动 base 1；被凶了会扣
+    const isOwner = brain.relation?.address && who === brain.relation.address;
+    if (!isOwner) {
+      const base = ev.care ? 8 : 1;
+      const valence = Number.isFinite(Number(ev.valence)) ? Number(ev.valence) : 1;
+      const d = bondDelta({ traits: brain.persona.traits, base, valence });
+      if (d) {
+        addBond(brain.memory, who, { delta: d, at, what: ev.care ? 'care' : 'talk' });
+        const b = bondOf(brain.memory, who);
+        if (b.tier !== 'stranger') appendAudit(id, { kind: 'bond', who, delta: d, score: b.score, tier: b.tier });
+      }
+    }
   }
 
   brain.meta.observations += 1;
@@ -487,34 +612,78 @@ function bigrams(text) {
   return set;
 }
 
-/** 每日结算：衰减 + TTL + 蜕皮检查。幂等，可以随便跑。 */
+/**
+ * 每日结算：人设衰减 + 记忆两层老化（压扁 → 遗忘）+ 蜕皮。幂等，可以随便跑。
+ *
+ * 老化不是"到期删除"：先压扁成一句"大概"，再更久没人提才真正遗忘。
+ * 全程把原文摊进 archive.jsonl——**忘的是检索，不是档案。**
+ */
 export function settleBrain(id = DEFAULT_ID, now = nowMs()) {
   const brain = ensureBrain(id);
   const days = Math.max(0, (now - (brain.meta.lastSettle ?? now)) / (24 * 60 * 60 * 1000));
   if (days >= 1) {
-    brain.persona.units = decay(brain.persona.units, Math.floor(days), now);
+    // ── 一年一度蜕壳：跨自然年时，把这一年掉出去的人设收进永久卡片 ──
+    const thisYear = new Date(now).getFullYear();
+    const prevYear = brain.persona.shellYear ?? thisYear;
+    if (thisYear > prevYear) {
+      const s = shellSummary(brain.persona.units, brain.memory.formerSelves, {
+        year: prevYear, at: now, yearMoves: brain.persona.yearMoves ?? {},
+      });
+      if (s.changed > 0) {
+        addCard(brain.memory, {
+          id: `shell_${prevYear}`,
+          kind: 'card',
+          title: s.title,
+          text: s.text,
+          at: now,
+          lastRecall: now,
+          expiresAt: now + 1000 * 365 * 24 * 60 * 60 * 1000,
+          consecutiveDays: 1,
+          longTerm: true,
+          // 永久：这是"我以前是谁"的唯一凭证，不许老化
+          important: true,
+          source: 'shell',
+        });
+        appendAudit(id, { kind: 'shell', year: prevYear, changed: s.changed, text: s.text.slice(0, 60) });
+      }
+      brain.persona.shellYear = thisYear;
+      brain.persona.shellAt = now;
+      brain.persona.yearMoves = {};
+      // 蜕了壳，「我是谁」要跟着重写
+      refreshNarrative(brain, 'shell');
+    }
+
+    // 人设：只有长期没人碰的命题才褪色
+    brain.persona.units = decay(brain.persona.units, Math.floor(days), now, { quietDays: compressDays });
     const sh = shed(brain.persona.units, { at: now });
     if (sh.formerSelves.length) {
       brain.persona.units = sh.units;
       brain.memory.formerSelves.push(...sh.formerSelves);
+      for (const f of sh.formerSelves) {
+        appendAudit(id, { kind: 'shed', id: f.id, weight: Number(f.weight.toFixed(3)), memoir: f.memoir });
+      }
     }
 
     if (ttlPolicy === 'summarize' || ttlPolicy === 'archive') {
-      // 过期前先压一张卡片——"忘了细节，但记得大概"
       const card = makeCard(brain.memory.episodes.slice(-12));
       if (card) addCard(brain.memory, card);
     }
 
-    const before = brain.memory.forgotten.length;
-    if (ttlPolicy !== 'off') settle(brain.memory, now);
+    const archived = [];
+    if (ttlPolicy !== 'off') {
+      settle(brain.memory, now, {
+        compressDays,
+        forgetDays,
+        onArchive: (item, reason) => archived.push({ ...item, archiveReason: reason }),
+      });
+    }
 
-    // archive：过期的不算真丢，摊到 archive.jsonl 里备查，免得 brain.json 越滚越大
-    if (ttlPolicy === 'archive' && brain.memory.forgotten.length > before) {
+    // 原文一律留档：压扁的和遗忘的都写进 archive.jsonl
+    if (archived.length) {
       try {
-        const newly = brain.memory.forgotten.slice(before);
         fs.appendFileSync(
           path.join(brainDir(id), 'archive.jsonl'),
-          `${newly.map((x) => JSON.stringify(x)).join('\n')}\n`,
+          `${archived.map((x) => JSON.stringify(x)).join('\n')}\n`,
           'utf8',
         );
       } catch (e) {
@@ -525,9 +694,18 @@ export function settleBrain(id = DEFAULT_ID, now = nowMs()) {
       brain.memory.forgotten = brain.memory.forgotten.slice(-500);
     }
 
+    // 提炼纲和伞：细节会烂，但"我认识他""这事发生过""我上过学"不能跟着烂
+    try {
+      distillGists(brain.memory, now);
+      distillUmbrellas(brain.memory, now);
+    } catch (e) {
+      logOnce(`[brain] 纲/伞提炼失败（已忽略）：${e?.message ?? e}`);
+    }
+
     brain.meta.lastSettle = now;
     refreshBrief(brain);
     saveBrain(brain);
+    if (archived.length) appendAudit(id, { kind: 'aging', archived: archived.length });
   }
   return brain;
 }
@@ -596,7 +774,11 @@ export function importEpisodes(id = DEFAULT_ID, list = [], { source = 'import' }
     const what = String(it?.text ?? it?.what ?? '').trim();
     if (!what) { skipped += 1; continue; }
     const at = Number(it?.at) || nowMs();
+    // ⚠️ 第三个参数必须是「现在」，不是 at。
+    // 它同时决定 lastRecall（多久没被提起）；传历史时间会让刚搬进来的记忆
+    // 一出生就过期，第一次结算就被清空。
     addEpisode(brain.memory, {
+      at,
       who: it.who ?? '',
       what: what.slice(0, 140),
       feel: it.feel ?? '',
@@ -606,8 +788,10 @@ export function importEpisodes(id = DEFAULT_ID, list = [], { source = 'import' }
       context: it.context ?? null,
       strategy: it.strategy ?? null,
       evidence: it.via ?? source,
-      source, // live | import
-    }, at);
+      source, // live | import | diary
+      // 搬进来的是「已经沉淀过的」——它在宿主那边活过了，不该再按新经历老化
+      ...(source === 'import' ? { longTerm: Boolean(it.longTerm ?? false) } : {}),
+    }, nowMs());
     imported += 1;
     const who = String(it.who ?? '').trim();
     if (who) touched.set(who, (touched.get(who) ?? 0) + 1);
@@ -732,8 +916,7 @@ export function learnEmotion(id = DEFAULT_ID, word, { pad, sources = [], cause =
 }
 
 /** 阶段三：从 ≥3 个实例里自己归纳出这个词的含义。 */
-export function induceEmotion(id = DEFAULT_ID, word) {
-  const brain = ensureBrain(id);
+export function induceEmotion(id = DEFAULT_ID, word) {  const brain = ensureBrain(id);
   const r = emotion.induce(brain.vocab, word);
   if (r.induced) {
     brain.vocab = r.vocab;
@@ -750,6 +933,67 @@ export function vocabOf(id = DEFAULT_ID) {
     words: Object.keys(brain.vocab),
     detail: brain.vocab,
   };
+}
+
+/**
+ * 给老鱼预装一份情绪词表。
+ *
+ * **新鱼用不到**——她该从"说不清"开始学。
+ * 但一条活了两年的鱼搬进来，不该从"哼哼"开始。
+ */
+export const BASIC_VOCAB = ['委屈', '生气', '高兴', '失落', '烦', '慌', '得意', '无聊', '累', '暖'];
+
+export function seedVocab(id = DEFAULT_ID, words = BASIC_VOCAB) {
+  const brain = ensureBrain(id);
+  let added = 0;
+  for (const w of words) {
+    if (brain.vocab[w]) continue;
+    const p = emotion.PROTOTYPES[w];
+    if (!p) continue;
+    brain.vocab[w] = {
+      pad: [...p.pad],
+      cause: p.cause,
+      body: p.body,
+      action: p.action,
+      instances: [],
+      sources: ['seed'],
+      learnedAt: Date.now(),
+    };
+    added += 1;
+  }
+  saveBrain(brain);
+  appendAudit(id, { kind: 'seed-vocab', added, total: Object.keys(brain.vocab).length });
+  return { ok: true, added, total: Object.keys(brain.vocab).length, stage: emotion.stageOf(brain.vocab) };
+}
+
+/**
+ * 精确导入词表（来自 exportPack，或别的系统导出的）。
+ * @param {Array} list [{ word, pad:[p,a,d], cause, body, action, instances }]
+ */
+export function importVocab(id = DEFAULT_ID, list = []) {
+  const brain = ensureBrain(id);
+  let imported = 0;
+  for (const it of Array.isArray(list) ? list : []) {
+    const word = String(it?.word ?? it?.name ?? '').trim();
+    if (!word) continue;
+    const proto = emotion.PROTOTYPES[word] ?? {};
+    const pad = Array.isArray(it.pad)
+      ? [0, 1, 2].map((i) => Math.max(-1, Math.min(1, Number(it.pad[i]) || 0)))
+      : (proto.pad ?? [0, 0, 0]);
+    brain.vocab[word] = {
+      pad,
+      cause: it.cause ?? proto.cause ?? '',
+      body: it.body ?? proto.body ?? '',
+      action: it.action ?? proto.action ?? '',
+      instances: Array.isArray(it.instances) ? it.instances.slice(-20) : [],
+      sources: [...new Set([...(it.sources ?? []), 'import'])].slice(-8),
+      learnedAt: Number(it.learnedAt) || Date.now(),
+    };
+    imported += 1;
+  }
+  saveBrain(brain);
+  appendAudit(id, { kind: 'import-vocab', imported, total: Object.keys(brain.vocab).length });
+  return { ok: true, imported, total: Object.keys(brain.vocab).length, stage: emotion.stageOf(brain.vocab) };
 }
 
 /* ── 记忆卡片：上下文过长时压缩中段 ───────────────────────────── */
@@ -1151,28 +1395,35 @@ export const MAX_EPISODES = 5000;
 
 /**
  * 容量保护：最老的一批压成卡片，原文进 archive.jsonl。
- * 只留最近 MAX_EPISODES 条在检索池里——不变大，也不真丢。
+ *
+ * 不是"一次吃掉两百条"——按 20 条一张卡片分批压，别让一次溢出把半年吃成 160 字。
  */
 function enforceCapacity(brain) {
   const eps = brain.memory.episodes;
-  if (eps.length <= MAX_EPISODES) return { compacted: 0 };
-  const overflow = eps.length - MAX_EPISODES;
-  const take = Math.min(overflow + 200, eps.length); // 一次多挤一点，别每条都触发
+  if (eps.length <= maxEpisodes) return { compacted: 0, cards: 0 };
+  const overflow = eps.length - maxEpisodes;
+  const take = Math.min(overflow, eps.length);
   const oldest = eps.slice(0, take);
-  const card = makeCard(oldest);
-  if (card) addCard(brain.memory, card);
+
+  let cards = 0;
+  for (let i = 0; i < oldest.length; i += 20) {
+    const chunk = oldest.slice(i, i + 20);
+    const card = makeCard(chunk);
+    if (card) { addCard(brain.memory, card); cards += 1; }
+  }
+
   try {
     fs.appendFileSync(
       path.join(brainDir(brain.id), 'archive.jsonl'),
-      `${oldest.map((x) => JSON.stringify(x)).join('\n')}\n`,
+      `${oldest.map((x) => JSON.stringify({ ...x, archiveReason: 'capacity' })).join('\n')}\n`,
       'utf8',
     );
   } catch (e) {
     logOnce(`[brain] 容量归档失败（已忽略）：${e?.message ?? e}`);
   }
   brain.memory.episodes = eps.slice(take);
-  appendAudit(brain.id, { kind: 'capacity', compacted: take });
-  return { compacted: take, card: card?.id ?? null };
+  appendAudit(brain.id, { kind: 'capacity', compacted: take, cards });
+  return { compacted: take, cards };
 }
 
 /**
@@ -1363,6 +1614,35 @@ export function listDiary(id = DEFAULT_ID) {
     .sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 
+/**
+ * 把**她以前写过的日记**搬进来。
+ *
+ * 不是把流水账重新生成一遍——那是造假。原样拷贝，一个字不改。
+ * @param {Array} list [{ date:'2025-11-20', text:'...' }]
+ */
+export function importDiary(id = DEFAULT_ID, list = [], { overwrite = false } = {}) {
+  const brain = ensureBrain(id);
+  const dir = diaryDir(id);
+  fs.mkdirSync(dir, { recursive: true });
+  let imported = 0;
+  let skipped = 0;
+  for (const it of Array.isArray(list) ? list : []) {
+    const date = String(it?.date ?? '').trim();
+    const text = String(it?.text ?? '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !text) { skipped += 1; continue; }
+    const file = diaryPath(id, date);
+    if (fs.existsSync(file) && !overwrite) { skipped += 1; continue; }
+    fs.writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
+    if (!Array.isArray(brain.meta.diary)) brain.meta.diary = [];
+    if (!brain.meta.diary.includes(date)) brain.meta.diary.push(date);
+    imported += 1;
+  }
+  brain.meta.diary = (brain.meta.diary ?? []).slice(-400);
+  saveBrain(brain);
+  appendAudit(id, { kind: 'import-diary', imported, skipped });
+  return { ok: true, imported, skipped, days: listDiary(id).length };
+}
+
 /** 日记也能被检索：问"你写过什么"时用它 */
 export function recallDiary(id = DEFAULT_ID, word = '', { limit = 3 } = {}) {
   const list = listDiary(id);
@@ -1376,6 +1656,250 @@ export function recallDiary(id = DEFAULT_ID, word = '', { limit = 3 } = {}) {
     if (hits.length >= limit) break;
   }
   return hits;
+}
+
+/* ── 特质：开放维度（她自己长出来的）────────────────────────── */
+
+/**
+ * 模型提名一个新维度（B 路径）。
+ *
+ * 脑不做"理解"——理解是模型的事。模型读完对话觉得"她今天很上头"，
+ * 就调这个把「上头」登记成她的一个维度，脑负责存、算、衰减、蜕皮。
+ */
+export function defineTrait(id = DEFAULT_ID, name = '', weight = 0.6, { source = 'model' } = {}) {
+  const brain = ensureBrain(id);
+  const n = String(name ?? '').trim();
+  if (n.length < 2 || n.length > 8) return { ok: false, reason: '维度名 2~8 个字' };
+  const w = Number.isFinite(Number(weight)) ? Math.max(0, Math.min(1, Number(weight))) : 0.6;
+
+  brain.persona.traits = { ...(brain.persona.traits ?? {}), [n]: w };
+  brain.persona.openTraits = { ...(brain.persona.openTraits ?? {}), [n]: w };
+  brain.self.style = styleVector(brain.persona.traits);
+  brain.self.styleName = dominantStyle(brain.self.style);
+  saveBrain(brain);
+  appendAudit(id, { kind: 'define-trait', name: n, weight: w, source });
+  return { ok: true, name: n, weight: w, total: Object.keys(brain.persona.traits).length };
+}
+
+/**
+ * 看她现在有哪些维度：哪些是先验的，哪些是她自己长出来的。
+ */
+export function traitReport(id = DEFAULT_ID) {
+  const brain = ensureBrain(id);
+  const known = new Set(Object.keys(brain.persona.knownTraits ?? TRAIT_LEXICON));
+  const rows = Object.entries(brain.persona.traits ?? {})
+    .map(([name, weight]) => ({
+      name,
+      weight: Number(Number(weight).toFixed(2)),
+      kind: known.has(name) ? 'known' : 'open',
+    }))
+    .sort((a, b) => b.weight - a.weight);
+  return {
+    total: rows.length,
+    known: rows.filter((r) => r.kind === 'known').length,
+    open: rows.filter((r) => r.kind === 'open').length,
+    rows,
+    openRows: rows.filter((r) => r.kind === 'open'),
+  };
+}
+
+/**
+ * 模型提名一条纲（B 路径）。
+ *
+ * 算法只能从字面统计出"什么词反复出现"，但**"这意味着什么"要靠理解**。
+ * 模型看完对话觉得"她好像把上学当成一件很重的事"，就调这个把它记成纲。
+ */
+export function defineGist(id = DEFAULT_ID, text = '', { keyword = '', count = 1 } = {}) {
+  const brain = ensureBrain(id);
+  const t = String(text ?? '').trim();
+  if (t.length < 4) return { ok: false, reason: '纲至少 4 个字' };
+  if (!Array.isArray(brain.memory.gists)) brain.memory.gists = [];
+  const key = keyword || t.slice(0, 8);
+  const id2 = `g_${key}`;
+  const existed = brain.memory.gists.find((g) => g.id === id2);
+  if (existed) {
+    existed.text = t;
+    existed.count = Number(count) || existed.count;
+    existed.at = nowMs();
+  } else {
+    brain.memory.gists.push({
+      id: id2, kind: 'gist', topic: 'model', keyword: key, text: t, count: Number(count) || 1, at: nowMs(),
+    });
+  }
+  saveBrain(brain);
+  appendAudit(id, { kind: 'define-gist', keyword: key, text: t.slice(0, 50) });
+  return { ok: true, id: id2, total: brain.memory.gists.length };
+}
+
+/**
+ * 标记「那个人不在了」。
+ *
+ * 不是解除关系——契约照旧永久，称呼照旧，记忆一条不删。
+ * 变的只是：她知道了，他不会再来。
+ *
+ * **必须显式调用。** 不许系统凭"多久没说话"去猜一个人死没死。
+ */
+export function markAbsent(id = DEFAULT_ID, { since, note = '', status = 'absent' } = {}) {
+  const brain = ensureBrain(id);
+  if (!brain.relation) return { ok: false, reason: '没有关系契约' };
+  brain.relation = markAbsentContract(brain.relation, { since, note, status });
+  // 他的人物伞改成"曾经一直在"——但伞本身不删
+  for (const u of brain.memory.umbrellas ?? []) {
+    if (u.topic === 'person' && u.who && u.who === brain.relation.address) {
+      u.absent = true;
+      u.text = `${u.who}：曾经一直在的人`;
+    }
+  }
+  saveBrain(brain);
+  appendAudit(id, { kind: 'absent', address: brain.relation.address, since: brain.relation.absentSince, note });
+  return { ok: true, relation: brain.relation, line: relationLine(brain.relation) };
+}
+
+/** 人回来了 / 标错了 */
+export function clearAbsent(id = DEFAULT_ID) {
+  const brain = ensureBrain(id);
+  brain.relation = clearAbsentRelation(brain.relation);
+  for (const u of brain.memory.umbrellas ?? []) {
+    if (u.topic === 'person' && u.absent) {
+      u.absent = false;
+      u.text = `${u.who}：一直在的人`;
+    }
+  }
+  saveBrain(brain);
+  appendAudit(id, { kind: 'absent-cleared', address: brain.relation?.address ?? '' });
+  return { ok: true, relation: brain.relation };
+}
+
+/* ── 概念：什么是什么，为什么要这么做 ───────────────────────── */
+
+/**
+ * 有人给她解释一个词。
+ *
+ * **这是"想通了"的那一刻**：不是新增记忆，是让过去几十条经历突然有了名字。
+ *
+ *   learnConcept('old', '上学', {
+ *     definition: '为了学到知识、学会道理',
+ *     why: '不然什么都不会',
+ *   })
+ */
+export function learnNewConcept(id = DEFAULT_ID, term = '', { definition = '', why = '', source = 'told', who = '' } = {}) {
+  const brain = ensureBrain(id);
+  const r = learnConcept(brain.memory, term, { definition, why, source, who, at: nowMs() });
+  if (!r.ok) return r;
+  refreshNarrative(id, 'concept');
+  saveBrain(brain);
+  appendAudit(id, { kind: 'concept', term: r.term, linked: r.linked, source });
+  return r;
+}
+
+/** 问她「X 是什么」——不知道就说不知道，不编 */
+export function askWhat(id = DEFAULT_ID, term = '') {
+  return conceptAnswer(ensureBrain(id).memory, term);
+}
+
+/** 她自己去问（因为不会才问，这才叫学习） */
+export function askSomeone(id = DEFAULT_ID, term = '', { knower = '' } = {}) {
+  const brain = ensureBrain(id);
+  const q = makeQuestion(brain.memory, term, { knower });
+  if (q.asked) appendAudit(id, { kind: 'ask', term: q.term, to: knower });
+  return q;
+}
+
+export function conceptList(id = DEFAULT_ID) {
+  const brain = ensureBrain(id);
+  const list = Object.values(brain.memory.concepts ?? {});
+  return {
+    total: list.length,
+    terms: list.map((c) => c.term),
+    detail: list,
+  };
+}
+
+/* ── 自我叙事：我是谁（会长的，不是写死的）────────────────────── */
+
+/**
+ * 重写「我是谁」。
+ *
+ * 用她自己的零件拼：出身 → 学会的道理 → 变过几次 → 谁一直在。
+ * 每一版都留下来——将来能说"我以前以为自己是……"。
+ */
+export function refreshNarrative(idOrBrain = DEFAULT_ID, why = 'auto') {
+  const fromId = typeof idOrBrain === 'string';
+  const brain = fromId ? ensureBrain(idOrBrain) : idOrBrain;
+  if (!brain) return { changed: false, text: '' };
+  const next = composeNarrative({
+    cardName: brain.roleCard ?? '鱼',
+    traits: brain.persona.traits,
+    umbrellas: brain.memory.umbrellas ?? [],
+    concepts: brain.memory.concepts ?? {},
+    shells: (brain.memory.cards ?? []).filter((c) => c.source === 'shell').length,
+    relation: brain.relation,
+  });
+  const prev = brain.self?.narrativeText ?? (typeof brain.self?.narrative === 'string' ? brain.self.narrative : '');
+  if (!narrativeChanged(prev, next)) {
+    if (fromId) { /* 没变也要落盘，保证首版存在 */ saveBrain(brain); }
+    return { changed: false, text: next, version: (brain.self?.narrativeHistory ?? []).length };
+  }
+
+  brain.self = brain.self ?? {};
+  brain.self.narrativeText = next;
+  brain.self.narrative = next;
+  if (!Array.isArray(brain.self.narrativeHistory)) brain.self.narrativeHistory = [];
+  brain.self.narrativeHistory = [...brain.self.narrativeHistory, { text: next, at: nowMs(), why }].slice(-12);
+  if (fromId) { saveBrain(brain); appendAudit(idOrBrain, { kind: 'narrative', why, text: next.slice(0, 60) }); }
+  return { changed: true, text: next, version: brain.self.narrativeHistory.length };
+}
+
+/** 模型改写「我是谁」（理解是模型的事，脑只负责存和留档） */
+export function setNarrative(id = DEFAULT_ID, text = '', { why = 'model' } = {}) {
+  const brain = ensureBrain(id);
+  const t = String(text ?? '').trim();
+  if (t.length < 6) return { ok: false, reason: '太短了' };
+  brain.self = brain.self ?? {};
+  brain.self.narrativeText = t.slice(0, NARRATIVE_MAX);
+  brain.self.narrative = brain.self.narrativeText;
+  if (!Array.isArray(brain.self.narrativeHistory)) brain.self.narrativeHistory = [];
+  brain.self.narrativeHistory = [...brain.self.narrativeHistory, { text: brain.self.narrativeText, at: nowMs(), why }].slice(-12);
+  saveBrain(brain);
+  appendAudit(id, { kind: 'narrative', why, text: brain.self.narrativeText.slice(0, 60) });
+  return { ok: true, text: brain.self.narrativeText, version: brain.self.narrativeHistory.length };
+}
+
+export function narrativeOf(id = DEFAULT_ID) {
+  const b = ensureBrain(id);
+  return {
+    text: b.self?.narrativeText ?? b.self?.narrative ?? '',
+    history: b.self?.narrativeHistory ?? [],
+    version: (b.self?.narrativeHistory ?? []).length,
+  };
+}
+
+/**
+ * 给一个**不是主人**的人标缺位（B 路径）。
+ *
+ * 主人走的是 relation.absent；爷爷奶奶、小主人这类人走这里。
+ * 门槛：恩情要到「对我挺好的」（close）以上——才配得上"我记住他不在了"。
+ */
+export function markAbsentFor(id = DEFAULT_ID, who = '', { since, note = '', status = 'absent' } = {}) {
+  const brain = ensureBrain(id);
+  const name = String(who ?? '').trim();
+  if (!name) return { ok: false, reason: '没说谁' };
+  if (name === brain.relation?.address) {
+    return markAbsent(id, { since, note, status });
+  }
+  const r = markBondAbsent(brain.memory, name, { since: since ?? nowMs(), note, status });
+  if (!r.ok) return r;
+  saveBrain(brain);
+  appendAudit(id, { kind: 'absent-bond', who: name, note });
+  return { ok: true, absence: r.absence, bond: r.bond, line: bondLine(brain.memory, name) };
+}
+
+export function clearAbsentFor(id = DEFAULT_ID, who = '') {
+  const brain = ensureBrain(id);
+  if (who === brain.relation?.address) return clearAbsent(id);
+  clearBondAbsent(brain.memory, who);
+  saveBrain(brain);
+  return { ok: true, who };
 }
 
 export function snapshot(id = DEFAULT_ID) {
@@ -1510,6 +2034,10 @@ export function createBrain(options = {}) {
     writeDiary(opts) { return writeDiary(id, opts); },
     readDiary(date) { return readDiary(id, date); },
     listDiary() { return listDiary(id); },
+    importDiary(list, opts) { return importDiary(id, list, opts); },
+    /** 老鱼预装情绪词 / 精确导入词表 */
+    seedVocab(words) { return seedVocab(id, words); },
+    importVocab(list) { return importVocab(id, list); },
     tick(now) { return settleBrain(id, now); },
     brief() { return getBrief(id); },
     snapshot() { return snapshot(id); },
@@ -1554,11 +2082,12 @@ export { LABELS, listBrains, readAudit, addImagination, addEpisode };
 export { flowLevel, flowName, styleVector };
 export { attribute } from './core/attribution.js';
 export { PATIENCE_DELTA, applyPatience, isOutburst, whimProbability, wakeReply, sampleStyle } from './core/derive.js';
-export { retrieve } from './core/memory.js';
+export { retrieve, settle, recall, touchByIds } from './core/memory.js';
 export { brief } from './core/persona.js';
 export { normalizeEvent, toCue, toObservation, shouldObserve, keywords } from './core/event.js';
 export { dataDir, roleDir } from './store.js';
 export { dataDirSource, isDataDirInsidePackage } from './store.js';
+export { readYear, listYears, setEpisodeWindow, episodeWindow } from './store.js';
 export { lintCard } from './core/extract.js';
 export { dedupeKey } from './adapters/qq-bridge.js';
 export { createBridgeAdapter } from './adapters/qq-bridge.js';
@@ -1574,9 +2103,10 @@ export {
   learn as learnWord, induce as induceWord, describeSensation,
 } from './core/emotion.js';
 
-/* 记忆卡片 */
+/* 记忆卡片 + 两层老化 */
 export {
   makeCard, addCard, shouldCompact, CARD_THRESHOLD_CHARS, CARD_MAX_CHARS,
+  COMPRESS_DAYS, FORGET_DAYS,
 } from './core/memory.js';
 
 /* 平台记忆 + 口味闭环 */

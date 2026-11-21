@@ -105,9 +105,14 @@ await t('检索时卡片会出现在"想到的"里', () => {
   assert.ok(r.text.includes('之前'), r.text);
 });
 
-await t('卡片也吃 30 天 TTL', () => {
+await t('卡片 2 年没人提才遗忘（2 年内都留着）', () => {
   const mem = emptyMemory();
-  mem.cards.push({ id: 'c', kind: 'card', text: 'x', at: 0, lastRecall: Date.now() - 40 * 86400000, consecutiveDays: 1, longTerm: false });
+  mem.cards.push({
+    id: 'c', kind: 'card', text: 'x', at: 0,
+    lastRecall: Date.now() - 800 * 86400000,
+    expiresAt: Date.now() - 86400000,
+    consecutiveDays: 1, longTerm: false,
+  });
   settle(mem);
   assert.equal(mem.cards.length, 0);
   assert.ok(mem.forgotten.some((f) => f.id === 'c'));

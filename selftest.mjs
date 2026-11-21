@@ -101,11 +101,45 @@ t('蜕皮后 memory.formerSelves 里查得到', () => {
 });
 
 console.log('\n── 记忆 ──');
-t('TTL 30 天到期进 forgotten', () => {
-  const m = { episodes: [{ id: 'a', kind: 'episode', lastRecall: Date.now() - 31 * 86400000, consecutiveDays: 1, longTerm: false }], imagination: [], facts: {}, impressions: {}, forgotten: [] };
-  settle(m);
+t('30 天没人提 → 压扁成一句"大概"（不是删除）', () => {
+  const now = Date.now();
+  const m = {
+    episodes: [{ id: 'a', kind: 'episode', who: '扶摇', what: '你嘴真硬', at: now - 31 * 86400000, lastRecall: now - 31 * 86400000, consecutiveDays: 1, longTerm: false }],
+    imagination: [], facts: {}, impressions: {}, forgotten: [], cards: [],
+  };
+  settle(m, now);
+  assert.equal(m.episodes.length, 1, '不该被删掉');
+  assert.equal(m.episodes[0].compressed, true);
+  assert.ok(m.episodes[0].what.includes('记不清'), m.episodes[0].what);
+  assert.equal(m.forgotten.length, 0);
+});
+
+t('2 年没人提 → 才真的遗忘', () => {
+  const now = Date.now();
+  const DAY = 86400000;
+  const m = {
+    episodes: [{
+      id: 'a', kind: 'episode', who: '扶摇', what: '两年前的事',
+      at: now - 800 * DAY, lastRecall: now - 800 * DAY,
+      compressed: true, cardedAt: now - 800 * DAY, expiresAt: now - 70 * DAY,
+      consecutiveDays: 1, longTerm: false,
+    }],
+    imagination: [], facts: {}, impressions: {}, forgotten: [], cards: [],
+  };
+  settle(m, now);
   assert.equal(m.episodes.length, 0);
   assert.equal(m.forgotten.length, 1);
+});
+
+t('一直被提起 → 压不了也忘不了', () => {
+  const now = Date.now();
+  const m = {
+    episodes: [{ id: 'a', kind: 'episode', what: '常聊的事', at: now - 500 * 86400000, lastRecall: now, consecutiveDays: 20, longTerm: false }],
+    imagination: [], facts: {}, impressions: {}, forgotten: [], cards: [],
+  };
+  settle(m, now);
+  assert.equal(m.episodes.length, 1);
+  assert.ok(!m.episodes[0].compressed, '不该被压扁');
 });
 
 t('连续 15 天升级长期，永不衰减', () => {

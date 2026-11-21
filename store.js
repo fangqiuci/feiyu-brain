@@ -101,7 +101,70 @@ export function readJson(file, fallback = null) {
   }
 }
 
-/** 原子写：先写临时文件再 rename，避免半截文件。 */
+/* ── 按年分片存 ───────────────────────────────────────────────
+ *
+ * brain.json 只放"她是谁"（人设/情绪/关系/卡片…），**不放经历**。
+ * 经历按年落进 brains/<id>/years/2026.jsonl。
+ *
+ * 为什么：一条活 16 年的鱼会有 1.7 万条经历，全塞一个 json 里
+ * 打开一次要解析几百 KB，越活越慢。分片 + 按窗口懒加载才是长期解。
+ */
+
+const DAY = 24 * 60 * 60 * 1000;
+let episodeWindowDays = 730; // 打开时加载最近多少天的经历
+
+export function setEpisodeWindow(days) {
+  const n = Number(days);
+  if (Number.isFinite(n) && n > 0) episodeWindowDays = Math.floor(n);
+}
+
+export function episodeWindow() {
+  return episodeWindowDays;
+}
+
+export function yearsDir(id) {
+  return path.join(brainDir(id), 'years');
+}
+
+export function yearFile(id, year) {
+  return path.join(yearsDir(id), `${year}.jsonl`);
+}
+
+function yearOf(ms) {
+  return new Date(Number(ms) || Date.now()).getFullYear();
+}
+
+/** 把一个年份的经历写成 jsonl（整年重写：一年最多一千多条，可接受） */
+function writeYearShard(id, year, list) {
+  ensureDir(yearsDir(id));
+  const file = yearFile(id, year);
+  if (!list.length) {
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch { /* 删不掉也无所谓 */ }
+    return null;
+  }
+  const body = `${list.map((e) => JSON.stringify(e)).join('\n')}\n`;
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body, 'utf8');
+  fs.renameSync(tmp, file);
+  const ats = list.map((e) => Number(e.at) || 0).filter(Boolean);
+  return {
+    count: list.length,
+    from: ats.length ? Math.min(...ats) : 0,
+    to: ats.length ? Math.max(...ats) : 0,
+  };
+}
+
+function readYearShard(id, year) {
+  const file = yearFile(id, year);
+  if (!fs.existsSync(file)) return [];
+  const out = [];
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    try { out.push(JSON.parse(s)); } catch { /* 坏行跳过，不整年报废 */ }
+  }
+  return out;
+}
 export function writeJsonAtomic(file, data) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.tmp`;
@@ -133,15 +196,46 @@ export function listBrains() {
 
 export function loadBrain(id) {
   const file = brainFile(id);
-  const main = readJson(file, null);
-  if (main) return main;
-  // 主文件坏了就退到备份——评审说得对，单文件损坏不该等于丢档
-  const bak = readJson(`${file}.bak`, null);
-  if (bak) {
-    try { writeJsonAtomic(file, bak); } catch { /* 修不回来也不影响这次读 */ }
-    return bak;
+  let main = readJson(file, null);
+  if (!main) {
+    // 主文件坏了就退到备份——单文件损坏不该等于丢档
+    const bak = readJson(`${file}.bak`, null);
+    if (bak) {
+      main = bak;
+      try { writeJsonAtomic(file, bak); } catch { /* 修不回来也不影响这次读 */ }
+    }
   }
-  return null;
+  if (!main) return null;
+
+  // ── 把窗口内的年份读回内存（更早的留在磁盘上，不加载）──
+  main.memory = main.memory ?? {};
+  const shards = main.memory.shards ?? {};
+  const cutoff = Date.now() - episodeWindowDays * DAY;
+  const eps = [];
+  for (const [y, meta] of Object.entries(shards)) {
+    const to = Number(meta?.to) || 0;
+    if (to && to < cutoff) continue;              // 太老的年份：不加载
+    eps.push(...readYearShard(id, Number(y)));
+  }
+  // 防御：万一旧版本留下的 brain.json 里还有 episodes，也并进来
+  if (Array.isArray(main.memory.episodes) && main.memory.episodes.length) {
+    eps.push(...main.memory.episodes);
+  }
+  main.memory.episodes = eps.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  return main;
+}
+
+/** 显式读某一年（翻旧账用） */
+export function readYear(id, year) {
+  return readYearShard(id, Number(year));
+}
+
+/** 她有哪些年份的经历 */
+export function listYears(id) {
+  const main = readJson(brainFile(id), null);
+  return Object.entries(main?.memory?.shards ?? {})
+    .map(([year, meta]) => ({ year: Number(year), ...meta }))
+    .sort((a, b) => a.year - b.year);
 }
 
 export function saveBrain(brain) {
@@ -149,6 +243,43 @@ export function saveBrain(brain) {
   try {
     if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
   } catch { /* 备份失败不影响写入 */ }
-  writeJsonAtomic(file, brain);
+
+  // ── 经历按年分片，不进 brain.json ──
+  const eps = Array.isArray(brain.memory?.episodes) ? brain.memory.episodes : [];
+  const byYear = new Map();
+  for (const e of eps) {
+    const y = yearOf(e.at);
+    if (!byYear.has(y)) byYear.set(y, []);
+    byYear.get(y).push(e);
+  }
+
+  const shards = {};
+  for (const [y, list] of byYear) {
+    const meta = writeYearShard(brain.id, y, list);
+    if (meta) shards[y] = meta;
+  }
+  // 这一年被清空了（忘光了/搬家后没剩）→ 把文件删掉
+  try {
+    const dir = yearsDir(brain.id);
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        const y = Number(f.replace(/\.jsonl$/, ''));
+        if (Number.isFinite(y) && !shards[y]) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ }
+        }
+      }
+    }
+  } catch { /* 读不到目录就算了 */ }
+
+  const out = {
+    ...brain,
+    memory: { ...(brain.memory ?? {}), shards },
+  };
+  delete out.memory.episodes;         // 经历在 years/*.jsonl
+  delete out.memory.shards?.episodes; // 防御
+
+  writeJsonAtomic(file, out);
+  brain.memory = brain.memory ?? {};
+  brain.memory.shards = shards;       // 内存对象保持一致
   return brain;
 }
