@@ -429,6 +429,69 @@ async function run() {
       return;
     }
 
+    case 'mouth': {
+      const C = await import('./lib/channels.mjs');
+      const sub = args[0] || 'status';
+      if (sub === 'detect') {
+        line('扫一遍常见网关…');
+        const found = await C.detect();
+        if (!found.length) {
+          line('✘ 一个都没找到。');
+          line('  确认一下：OneBot 的 HTTP 服务开着吗？（SnowLuma/NapCat/Lagrange/go-cqhttp）');
+          line('  或者手工指定：npx feiyu say --via onebot --base http://127.0.0.1:3000 --token xxx');
+          return;
+        }
+        C.saveChannels(brain.dataDir(), found.map(({ impl, implName, baseUrl, token, uin, nickname }) => ({ impl, implName, baseUrl, token, uin, nickname })));
+        line(`✔ 找到 ${found.length} 个，已记住`);
+        for (const f of found) line(`  ${f.implName.padEnd(16)} ${f.baseUrl}  ${f.uin ?? ''} ${f.nickname ?? ''}`);
+        return;
+      }
+      if (sub === 'list') {
+        const saved = C.loadChannels(brain.dataDir());
+        if (!saved.length) { line('还没存过通道。跑 npx feiyu mouth detect'); return; }
+        const st = await C.statusOf(brain.dataDir());
+        for (const x of st) line(`  ${x.alive ? '✔' : '✘'} ${String(x.implName).padEnd(16)} ${x.baseUrl}  ${x.uin ?? ''} ${x.nickname ?? ''}`);
+        return;
+      }
+      const m = await C.resolveMouth({ dataDir: brain.dataDir() });
+      if (!m) { line('✘ 没有可用的嘴。跑 npx feiyu mouth detect'); return; }
+      line(`✔ 能用的嘴：${m.implName} ${m.baseUrl}  ${m.uin ?? ''} ${m.nickname ?? ''}（${m.source}）`);
+      return;
+    }
+
+    case 'say': {
+      const flag = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+      const via = flag('--via') || 'window';
+      const target = flag('--target') || flag('--to') || '';
+      const skip = new Set(['--via', '--target', '--to', '--kind', '--base', '--token']);
+      const words = [];
+      for (let i = 0; i < args.length; i += 1) {
+        if (skip.has(args[i])) { i += 1; continue; }
+        if (String(args[i]).startsWith('--')) continue;
+        words.push(args[i]);
+      }
+      const text = words.join(' ') || '';
+      if (!text) {
+        line('用法：');
+        line('  npx feiyu say --via onebot --target <群号> "要说的话"');
+        line('  npx feiyu say --via window --target QQ "要说的话"');
+        return;
+      }
+      const S = await import('./lib/say.mjs');
+      const r = await S.say({
+        text, via, target, title: target,
+        kind: flag('--kind') || 'group',
+        baseUrl: flag('--base') || '',
+        token: flag('--token') || '',
+      });
+      if (!r.ok) {
+        line(`✘ ${r.code}: ${r.text}`);
+        return;
+      }
+      line(`✔ 发出去了 ${r.evidence || ''}`);
+      return;
+    }
+
     case 'body': {
       const kind = args[0];
       const s = brain.snapshot(ID);
@@ -459,7 +522,7 @@ async function run() {
     }
 
     default:
-      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve|vocab]');
+      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve|vocab|say|mouth]');
   }
 }
 

@@ -4,6 +4,7 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { ROOT } from './store.js';
@@ -26,14 +27,27 @@ function t(name, fn) {
 }
 
 const ID = 'selftest';
-const dir = path.join(ROOT, 'state', 'brains', ID);
+// 自测跑在临时目录里，不往包目录写东西（审查报告 A4）
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'feiyu-selftest-'));
+brain.configure({ dataDir: TMP, roleDir: path.join(TMP, 'roles') });
+const dir = path.join(TMP, 'brains', ID);
 if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
 
 console.log('\n── 出生 ──');
-const b = brain.birth({ id: ID, relation: 'parent', address: '妈' });
+// 内联一张测试卡：干净机器上不该因为没有角色卡就崩（审查报告 A3）
+const TEST_CARD = [
+  '你是测试鱼。',
+  '性格：嘴硬=0.8 心软=0.6 好奇=0.7 好动=0.6',
+  '- 我嘴硬，被怼会顶回去。',
+  '- 我记仇但记不久。',
+  '- 不要客服腔。',
+  '- 我喜欢解压类的视频。',
+  '- 有人认真跟我说话，我会收起腔调。',
+].join('\n');
+const b = brain.birth({ id: ID, relation: 'parent', address: '妈', cardText: TEST_CARD, cardName: '测试鱼' });
 
 t('从角色卡抽出命题', () => {
-  assert.ok(b.persona.units.length > 20, `只抽到 ${b.persona.units.length} 条`);
+  assert.ok(b.persona.units.length > 3, `只抽到 ${b.persona.units.length} 条`);
 });
 
 t('有身份命题', () => {

@@ -172,9 +172,20 @@ export function writeJsonAtomic(file, data) {
   fs.renameSync(tmp, file);
 }
 
+const AUDIT_MAX_BYTES = 2 * 1024 * 1024;
+
 export function appendAudit(id, entry) {
   ensureDir(brainDir(id));
-  fs.appendFileSync(auditFile(id), `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, 'utf8');
+  const file = auditFile(id);
+  // 轮转：审计只追加，长期跑会无限长（审查报告 B3）
+  try {
+    if (fs.existsSync(file) && fs.statSync(file).size > AUDIT_MAX_BYTES) {
+      const old = `${file}.1`;
+      try { if (fs.existsSync(old)) fs.unlinkSync(old); } catch { /* 忽略 */ }
+      fs.renameSync(file, old);
+    }
+  } catch { /* 转不过去就继续追加 */ }
+  fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, 'utf8');
 }
 
 export function readAudit(id, limit = 20) {

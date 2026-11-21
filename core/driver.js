@@ -120,6 +120,62 @@ export class DesktopDriver {
   async exec(action) {
     try {
       switch (action.type) {
+        case 'focus': {
+          const t = String(action.title ?? action.target ?? '');
+          if (!t) return fail('E_ARGS', 'focus 需要 title');
+          const ps = `$ws=New-Object -ComObject WScript.Shell; if(-not $ws.AppActivate(${JSON.stringify(t)})){Write-Output "NO_WINDOW"; exit 2}`;
+          const { stdout } = await run('powershell', ['-NoProfile', '-Command', ps], { timeout: 10000 });
+          if (String(stdout).includes('NO_WINDOW')) return fail('E_NO_WINDOW', `没找到标题含「${t}」的窗口`);
+          return ok({ evidence: `desktop:focus:${t}` });
+        }
+        case 'click': {
+          const x = Number(action.x);
+          const y = Number(action.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return fail('E_ARGS', 'click 需要 x / y');
+          if (action.dryRun === true) return ok({ evidence: `desktop:click:${x},${y}`, dryRun: true });
+          const ps = [
+            'Add-Type -AssemblyName System.Windows.Forms;',
+            'Add-Type -AssemblyName System.Drawing;',
+            '$sig=\'[DllImport("user32.dll")] public static extern void mouse_event(int f,int dx,int dy,int d,int e);\';',
+            '$m=Add-Type -MemberDefinition $sig -Name U -PassThru;',
+            `[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y});`,
+            'Start-Sleep -Milliseconds 60;',
+            '$m::mouse_event(0x02,0,0,0,0); $m::mouse_event(0x04,0,0,0,0);',
+          ].join(' ');
+          await run('powershell', ['-NoProfile', '-Command', ps], { timeout: 15000 });
+          return ok({ evidence: `desktop:click:${x},${y}` });
+        }
+        case 'type': {
+          const text = String(action.text ?? '');
+          if (!text) return fail('E_ARGS', 'type 需要 text');
+          if (action.dryRun === true) return ok({ evidence: `desktop:type:${text.slice(0, 20)}`, dryRun: true });
+          const ps = [
+            'Add-Type -AssemblyName System.Windows.Forms;',
+            `Set-Clipboard -Value ${JSON.stringify(text)};`,
+            'Start-Sleep -Milliseconds 100;',
+            '[System.Windows.Forms.SendKeys]::SendWait("^v");',
+          ].join(' ');
+          await run('powershell', ['-NoProfile', '-Command', ps], { timeout: 15000 });
+          return ok({ evidence: `desktop:type:${text.slice(0, 20)}` });
+        }
+        case 'key': {
+          const k = String(action.key ?? 'ENTER').toUpperCase();
+          const map = { ENTER: '{ENTER}', TAB: '{TAB}', ESC: '{ESC}', BACKSPACE: '{BACKSPACE}', SPACE: ' ' };
+          const seq = map[k] ?? `{${k}}`;
+          await run('powershell', ['-NoProfile', '-Command',
+            `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(seq)})`], { timeout: 10000 });
+          return ok({ evidence: `desktop:key:${k}` });
+        }
+        case 'scroll': {
+          const delta = Number(action.delta ?? -3);
+          const ps = [
+            '$sig=\'[DllImport("user32.dll")] public static extern void mouse_event(int f,int dx,int dy,int d,int e);\';',
+            '$m=Add-Type -MemberDefinition $sig -Name U2 -PassThru;',
+            `$m::mouse_event(0x0800,0,0,${Math.round(delta * 120)},0);`,
+          ].join(' ');
+          await run('powershell', ['-NoProfile', '-Command', ps], { timeout: 10000 });
+          return ok({ evidence: `desktop:scroll:${delta}` });
+        }
         case 'open_app': {
           const target = action.target || action.package;
           if (!target) return fail('E_ARGS', 'open_app 需要 target');
@@ -140,6 +196,24 @@ export class DesktopDriver {
           ].join('');
           await run('powershell', ['-NoProfile', '-Command', ps], { timeout: this.timeoutMs });
           return fs.existsSync(file) ? ok({ evidence: file }) : fail('E_SCREENSHOT', '截屏没生成文件');
+        }
+        case 'open_url': {
+          const url = String(action.url ?? action.target ?? '');
+          if (!/^https?:\/\//i.test(url)) return fail('E_ARGS', '只认 http(s) 链接');
+          await run('powershell', ['-NoProfile', '-Command', `Start-Process ${JSON.stringify(url)}`], { timeout: this.timeoutMs });
+          return ok({ evidence: `desktop:url:${url.slice(0, 60)}` });
+        }
+        case 'shell': {
+          // 手最危险的一档：必须宿主当场授权（force:true）
+          if (action.force !== true) return fail('E_NEED_APPROVAL', '执行命令要宿主当场授权（force:true）');
+          const cmd = String(action.command ?? '');
+          if (!cmd) return fail('E_ARGS', 'shell 需要 command');
+          if (action.dryRun === true) return ok({ evidence: `desktop:dry:${cmd.slice(0, 60)}`, dryRun: true });
+          const { stdout, stderr } = await run('powershell', ['-NoProfile', '-Command', cmd], {
+            timeout: Math.min(Number(action.timeoutMs) || this.timeoutMs, 120000),
+            maxBuffer: 8 * 1024 * 1024,
+          });
+          return ok({ evidence: `desktop:shell:${cmd.slice(0, 60)}`, stdout: String(stdout).slice(-4000), stderr: String(stderr).slice(-2000) });
         }
         case 'uninstall':
           // 桌面卸载 = 删程序，不可逆。一律拒绝，走人工。

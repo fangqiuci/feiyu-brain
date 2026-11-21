@@ -57,14 +57,79 @@ function condense(text, max = 46) {
 }
 
 /**
+/**
+ * 「规章制度」样子的行：讲的是怎么说话、能做什么不能做什么，
+ * 不是她是什么人。
+ *
+ * 这类行在 brief 里占比一高，模型读到全是禁令，执行出来就是短、冷、不接话。
+ */
+const RULE_RE = /(允许|默认|禁止|必须|不要|不得|不能|可以.{0,6}吗|请(?:你)?|规则|原则|要求|设定|格式|回答时|回复时|每条|一条消息|字数|1~10|口癖|自称|短句|连发|隔几秒|省略主语)/;
+
+function isRule(text) {
+  return RULE_RE.test(String(text ?? ''));
+}
+
+/**
  * 她现在的样子（每次唤醒注入的唯一入口）。
  *
  * 规则：
  *   1. 按 kind 分层（身份 → 性格 → 偏好 → 约束）
  *   2. 同层按权重降序
  *   3. 每条压成一句短话，总字数 ≤ 300
+ *   4. **"规章制度"类的行最多占 1/4**
+ *
+/**
+ * 说话方式（含话多话少）—— **从人设算出来，不是规则**。
+ *
+ * 这一点很关键：话少不该是「默认 1~10 字」这种死规矩，
+ * 它应该是「她懒、她敏感、她懒得解释」的自然结果。
+ *
+ * 算出来之后有两个用处：
+ *   ① brief 本身跟着变短/变长——她连介绍自己都懒得说全
+ *   ② 注入的"她"少 → 模型自然说得少
+ *
+ * 而且它会随 traits 漂移：一条活泼的鱼跑几年变懒了，brief 自己就缩了。
  */
-export function brief(units, { maxChars = BRIEF_MAX_CHARS } = {}) {
+export function speechProfile(traits = {}) {
+  const g = (k) => Number(traits[k] ?? 0.5);
+  const verbosity = Math.max(0.05, Math.min(1,
+    0.15
+    + 0.50 * g('活泼')
+    + 0.40 * g('社交')
+    + 0.15 * g('好奇')
+    - 0.45 * g('懒')
+    - 0.25 * g('敏感')
+    - 0.20 * g('嘴硬'),
+  ));
+
+  // 话多 → brief 用满 300；话少 → 只有 130
+  const chars = Math.round(130 + 170 * verbosity);
+  const label = verbosity > 0.66 ? '话多' : verbosity > 0.36 ? '话一般' : '话少';
+
+  return {
+    verbosity: Number(verbosity.toFixed(2)),
+    label,
+    chars,
+    // 给宿主/调试看的一句话，不进 brief
+    note: `她${label}（verbosity ${verbosity.toFixed(2)}）`,
+  };
+}
+
+/**
+ * 她现在的样子（每次唤醒注入的唯一入口）。
+ *
+ * 规则：
+ *   1. 按 kind 分层（身份 → 性格 → 偏好 → 约束）
+ *   2. 同层按权重降序
+ *   3. 每条压成一句短话，总字数由人设决定（见 speechProfile）
+ *   4. "规章制度"类的行最多占 1/4
+ *
+ * 注意：**规章不该搬到别处，该删掉或者改写成性格。**
+ *   「默认 1~10 字」  → 死规则，永远不会因为心情变
+ *   「她懒，懒得多说」→ 性格，会被经历改变
+ * ruleShare 传 0 就是一条规章都不要。
+ */
+export function brief(units, { maxChars = BRIEF_MAX_CHARS, ruleShare = 0.25 } = {}) {
   if (!Array.isArray(units) || units.length === 0) return '';
 
   const ordered = units.slice().sort((a, b) => {
@@ -77,19 +142,27 @@ export function brief(units, { maxChars = BRIEF_MAX_CHARS } = {}) {
   const picked = [];
   const seen = new Set();
   let used = 0;
+  let ruleChars = 0;
+  const ruleCap = Math.floor(maxChars * Math.max(0, Math.min(1, ruleShare)));
 
-  for (const u of ordered) {
+  // 先挑"她是谁"，再让规章挤剩下的空
+  const pool = [...ordered.filter((u) => !isRule(u.text)), ...ordered.filter((u) => isRule(u.text))];
+
+  for (const u of pool) {
     const t = condense(u.text);
     if (t.length < 5) continue;
     const key = t.slice(0, 10);
     if (seen.has(key)) continue;
     if (picked.some((p) => similar(p, t))) continue;
     const cut = t.length > 46 ? `${t.slice(0, 46)}…` : t;
-    const add = cut.length + 1; // +1 for separator
+    const add = cut.length + 1;
     if (used + add > maxChars) continue;
+    const rule = isRule(u.text);
+    if (rule && ruleChars + add > ruleCap) continue;
     seen.add(key);
     picked.push(cut);
     used += add;
+    if (rule) ruleChars += add;
   }
 
   return picked.join('；');

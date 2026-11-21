@@ -11,7 +11,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import { birthFromCard, lintCard, TRAIT_LEXICON } from './core/extract.js';
-import { brief, decay, evolve, shed, weightReport, shellSummary, recentShift } from './core/persona.js';
+import { brief, decay, evolve, shed, weightReport, shellSummary, recentShift, speechProfile } from './core/persona.js';
 import { styleVector, flowLevel, flowName, hashTraits, mulberry32 } from './core/derive.js';
 import { createBody, chooseBody, bodyLine, canDo, hasCapability, CAPABILITY, BODY_KINDS, BODY_PROFILES, recordAction } from './core/body.js';
 import { emptyMemory, addEpisode, addImagination, recall, settle, retrieve, touchByIds, distillGists, distillUmbrellas, nameFaded, detectRepeat, markImportant, markImportantByTopic, isRepeatNoise, textSimilarity, IMPORTANT_REPEAT, IMPORTANT_WINDOW_DAYS } from './core/memory.js';
@@ -46,7 +46,8 @@ let ttlPolicy = 'hard';        // hard | summarize | archive | off
 let moodPolicy = 'brain';      // 情绪双源：brain（脑说了算）| host（宿主说了算）| blend（各一半）
 let compressDays = 21;         // 完整期：21 天没人提 → 压成卡片
 let forgetDays = 730;          // 卡片期：2 年没人提 → 遗忘
-let briefChars = 300;          // 「此刻的她」多长；老鱼可以调大
+let briefChars = 300;
+let briefRules = 0.25;   // 规章在 brief 里的配额；0 = 一条都不要          // 「此刻的她」多长；老鱼可以调大
 let maxEpisodes = 5000;        // 脑里最多存多少条，超了最老的压卡片
 
 function nowMs() {
@@ -81,7 +82,7 @@ function logOnce(msg) {
  *   configure({ maxEpisodes: 5000 })      脑里最多存多少条
  */
 export function configure({
-  dataDir: d, roleDir: r, shadow, ttl, mood,
+  dataDir: d, roleDir: r, shadow, ttl, mood, briefRules: br,
   compressDays: cd, forgetDays: fd, briefChars: bc, maxEpisodes: me,
 } = {}) {
   if (d) setDataDir(d);
@@ -94,6 +95,7 @@ export function configure({
   // 经历按年分片：打开时只加载 forgetDays 窗口内的年份（16 年也不会越读越慢）
   setEpisodeWindow(forgetDays);
   if (Number.isFinite(bc) && bc >= 100) briefChars = Math.floor(bc);
+  if (br) briefRules = br === 'drop' ? 0 : 0.25;
   if (Number.isFinite(me) && me >= 100) maxEpisodes = Math.floor(me);
 }
 
@@ -169,7 +171,12 @@ export function resolveRoleCard(roleName) {
 }
 
 function refreshBrief(brain) {
-  brain.persona.brief = brief(brain.persona.units, { maxChars: briefChars });
+  // brief 多长，由人设算——话少的鱼，连介绍自己都懒得说全
+  const prof = speechProfile(brain.persona.traits);
+  brain.persona.brief = brief(brain.persona.units, {
+    maxChars: Math.min(briefChars, prof.chars),
+    ruleShare: briefRules,
+  });
   return brain;
 }
 
@@ -270,6 +277,8 @@ export function ensureBrain(id = DEFAULT_ID) {
   if (cache.has(id)) return cache.get(id);
   let brain = loadBrain(id);
   if (!brain) brain = birth({ id });
+  // 老版本存档要补齐形状，否则升级当天她就没法说话
+  brain = normalizeBrain(brain);
   cache.set(id, brain);
   return brain;
 }
@@ -1900,6 +1909,102 @@ export function clearAbsentFor(id = DEFAULT_ID, who = '') {
   clearBondAbsent(brain.memory, who);
   saveBrain(brain);
   return { ok: true, who };
+}
+
+/**
+ * 老版本 brain.json 的形状补齐。
+ *
+ * 1.2.0 时代的 brain.json 没有 vocab / gists / concepts / bonds…，
+ * 新版代码直接读就会崩。崩在宿主里 = 注入段拿不到 = **她一夜之间变冷淡**。
+ *
+ * 升级不该让一条活了几年的鱼突然失语，所以这里全部兜住。
+ */
+function normalizeBrain(brain) {
+  if (!brain || typeof brain !== 'object') return brain;
+  const M = emptyMemory();
+  brain.memory = { ...M, ...(brain.memory ?? {}) };
+  for (const k of ['facts', 'taste', 'impressions', 'apps', 'strategies']) {
+    if (!brain.memory[k] || typeof brain.memory[k] !== 'object') brain.memory[k] = {};
+  }
+  for (const k of ['episodes', 'imagination', 'cards', 'gists', 'formerSelves', 'forgotten', 'pending', 'umbrellas']) {
+    if (!Array.isArray(brain.memory[k])) brain.memory[k] = [];
+  }
+  for (const k of ['concepts', 'bonds', 'absences']) {
+    if (!brain.memory[k] || typeof brain.memory[k] !== 'object') brain.memory[k] = {};
+  }
+
+  brain.vocab = (brain.vocab && typeof brain.vocab === 'object') ? brain.vocab : {};
+  brain.persona = brain.persona ?? {};
+  if (!Array.isArray(brain.persona.units)) brain.persona.units = [];
+  if (!brain.persona.traits || typeof brain.persona.traits !== 'object') brain.persona.traits = {};
+  if (!Array.isArray(brain.persona.moves)) brain.persona.moves = [];
+  if (!brain.persona.yearMoves || typeof brain.persona.yearMoves !== 'object') brain.persona.yearMoves = {};
+  if (!brain.persona.brief) brain.persona.brief = '';
+
+  brain.self = brain.self ?? {};
+  if (!Array.isArray(brain.self.narrativeHistory)) brain.self.narrativeHistory = [];
+  brain.meta = brain.meta ?? {};
+  if (!Array.isArray(brain.meta.contractWarnings)) brain.meta.contractWarnings = [];
+  if (!Number.isFinite(brain.meta.observations)) brain.meta.observations = 0;
+  return brain;
+}
+
+/* ── 嘴：她说一句话（接模型）────────────────────────────────── */
+
+/**
+ * 让她说一句。
+ *
+ *   ① 取「此刻的她」→ ② 拼 system → ③ 调模型 → ④ 把这一轮记回去
+ *
+ * 不给 key 不会崩，会明确返回 E_NO_LLM。
+ *
+ * @param {object} [mouth] createMouth() 的返回值；不传就用环境变量现造
+ */
+export async function speak(id = DEFAULT_ID, event = {}, { mouth = null, sections = null, budget = 500, extra = '' } = {}) {
+  const brain = ensureBrain(id);
+  const state = wakeLine(id, event, {
+    sections: sections ?? ['persona', 'self', 'relation', 'bond', 'concept', 'mood', 'recent', 'memory'],
+    budget,
+  });
+
+  let m = mouth;
+  if (!m) {
+    const { createMouth } = await import('./lib/llm.mjs');
+    m = createMouth();
+  }
+  if (!m.configured) {
+    return {
+      ok: false,
+      code: 'E_NO_LLM',
+      text: '她张了张嘴，但没地方说话（没配模型：设 FEIYU_LLM_KEY，或传 mouth）',
+      state,
+    };
+  }
+
+  const { buildSystemPrompt } = await import('./lib/llm.mjs');
+  const sender = event?.sender ?? event?.who ?? '';
+  const userText = String(event?.text ?? '').slice(0, 400);
+  const r = await m.say({
+    system: buildSystemPrompt(state, { extra }),
+    messages: userText ? [{ role: 'user', content: `${sender ? `${sender}：` : ''}${userText}` }] : [],
+  });
+  if (!r.ok) return { ...r, state };
+
+  // 说出去的话也算一次经历——她会记得自己说过
+  try {
+    observe(id, {
+      who: sender,
+      text: `我说：${r.text}`,
+      what: `我说：${r.text}`.slice(0, 80),
+      via: 'mouth',
+      valence: 0.2,
+      intensity: 0.3,
+    }, { evolve: true });
+  } catch (e) {
+    logOnce(`[brain] 说完没记上（已忽略）：${e?.message ?? e}`);
+  }
+
+  return { ok: true, text: r.text, state, model: r.model ?? null, usage: r.usage ?? null };
 }
 
 export function snapshot(id = DEFAULT_ID) {
