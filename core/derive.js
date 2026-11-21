@@ -64,7 +64,15 @@ export function styleVector(traits) {
   const denial = 0.8 * (traits.嘴硬 ?? 0) + 0.2 * (traits.敏感 ?? 0);
   const fixed = 0.8 * (traits.固执 ?? 0) + 0.2 * (traits.自信 ?? 0);
   const naive = Math.max(0.02, 1 - Math.max(aware, denial, fixed));
-  return norm({ aware, denial, fixed, naive });
+  // 开放维度（卡里长出来的「洁癖」「工作狂」）不归任何固定轴，
+  // 但它们是"这个人独特的地方"，单独给一个分量，宿主可以拿去用。
+  const KNOWN = new Set(['嘴硬', '心软', '好奇', '好动', '敏感', '固执', '自信', '爱反思', '理性', '社交', '活泼', '懒']);
+  const openVals = Object.entries(traits || {}).filter(([k]) => !KNOWN.has(k)).map(([, v]) => Number(v) || 0);
+  const custom = openVals.length ? Math.min(1, openVals.reduce((a, b) => a + b, 0) / openVals.length) : 0;
+  const vec = norm({ aware, denial, fixed, naive });
+  // 只有真的长出开放维度才挂这一项——否则会破坏"Σ4 = 1"的不变量
+  if (custom > 0) vec.custom = custom;
+  return vec;
 }
 
 /** 按 style 向量抽样。抽样由调用方传 rng（确定性输入），保证可回放。 */

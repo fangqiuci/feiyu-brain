@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 // 对外只有几个方法：出生 / 取 brief / 唤醒 / 观察 / 结算 / 快照。
 //
 // 两种用法：
@@ -417,9 +418,16 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
   const doEvolve = opts?.evolve !== false;
   const doRemember = opts?.remember !== false;
 
-  const ev = event.consistent || event.conflicting || !event.sender
+  // 事件归一化会只留下聊天字段，把"刷到了什么/什么反应"丢掉。
+  // 那样"经历改变性格"这条闭环永远不触发——所以这里先留下来再合并。
+  const KEEP = ['app', 'category', 'title', 'reaction', 'minutes', 'duration', 'valence', 'intensity', 'care', 'what'];
+  const kept = {};
+  for (const k of KEEP) if (event?.[k] !== undefined) kept[k] = event[k];
+
+  const evBase = event.consistent || event.conflicting || !event.sender
     ? event
     : normalizeEvent(event, event.platform);
+  const ev = { ...evBase, ...kept };
 
   const consistent = ev.consistent ?? matchUnits(brain.persona.units, ev.text ?? '').consistent;
   const conflicting = ev.conflicting ?? matchUnits(brain.persona.units, ev.text ?? '').conflicting;
@@ -555,7 +563,14 @@ export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
     // 看的解压视频多了，"懒"这条特质就真的涨一点；人设变了，下次爱看的就不一样。
     // evolve:false 时这条也关掉——只当记忆库用，就不该偷偷改人设。
     if (doEvolve) {
-      const { traits: nextTraits, delta } = nudgeTraits(brain.persona.traits, ev.kind ?? '', Number(ev.reaction) || 0);
+      // 特征漂移要的是"她在哪个 App 上看到什么、什么反应"。
+    // 原来传的是 ev.kind（永远是 'message'），NUDGE 里查不到 → 永远不触发。
+    const REACTION_SCORE = { like: 1, love: 1, favorite: 1, collect: 1, comment: 0.6, share: 0.5, view: 0.2, see: 0.2, skip: -1, dislike: -1, block: -1 };
+    const rawReaction = ev.reaction;
+    const reactionN = typeof rawReaction === 'number'
+      ? rawReaction
+      : (REACTION_SCORE[String(rawReaction ?? '')] ?? (Number(rawReaction) || 0));
+    const { traits: nextTraits, delta } = nudgeTraits(brain.persona.traits, ev.category ?? ev.app ?? '', reactionN);
       if (Object.keys(delta).length) {
         brain.persona.traits = nextTraits;
         brain.self.style = styleVector(nextTraits);
@@ -833,6 +848,8 @@ export function touch(id, key, { pool = 'facts' } = {}) {
  * 没有身体也能活着——只是"想而不得"。
  */
 export function setBody(id = DEFAULT_ID, kind, { ownership, apps, scope } = {}) {
+  // 允许直接传 { kind: 'desktop' }，少踩一次坑
+  if (kind && typeof kind === 'object') kind = kind.kind;
   const brain = ensureBrain(id);
   const prev = brain.body?.kind ?? null;
   brain.body = createBody({
@@ -1034,7 +1051,33 @@ export function cardsOf(id = DEFAULT_ID) {
 
 const drivers = new Map(); // id -> driver
 
+/**
+ * 老鱼的身体可能还写着 phone（它是在手机语境下长大的），搬到电脑上"手"就废了。
+ * 不偷偷换身体——但真要用手的这一刻，发现这台机器根本没有手机，
+ * 就当场纠正并记一笔，让她自己知道"我换了个身体"。
+ */
+function autoHealBody(brain) {
+  const kind = brain?.body?.kind;
+  if (kind !== 'phone' && kind !== 'tablet') return null;
+  const onDesktop = process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux';
+  if (!onDesktop) return null;
+  let hasAdb = false;
+  try {
+    const out = execFileSync('adb', ['devices'], { timeout: 2000, encoding: 'utf8' });
+    hasAdb = /\tdevice\b/.test(String(out));
+  } catch {
+    hasAdb = false;
+  }
+  if (hasAdb) return null;
+  const from = brain.body.kind;
+  brain.body = { ...brain.body, kind: 'desktop', healedFrom: from, healedAt: nowMs() };
+  try { appendAudit(brain.id, { kind: 'body-heal', from, to: 'desktop', why: '这台是电脑，没有手机设备' }); } catch { /* 记不上就算了 */ }
+  return { from, to: 'desktop' };
+}
+
 function getDriver(brain) {
+  // 老鱼可能还写着 phone，但这台是电脑——真要用手的这一刻当场纠正
+  autoHealBody(brain);
   const key = `${brain.id}:${brain.body?.kind}:${brain.body?.ownership}`;
   if (drivers.has(key)) return drivers.get(key);
   const d = driverFor(brain.body, {

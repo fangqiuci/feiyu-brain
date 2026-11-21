@@ -459,6 +459,15 @@ async function run() {
       return;
     }
 
+    case 'trait': {
+      const name = args[0];
+      if (!name) { line('用法：npx feiyu trait <维度名> [权重0~1]'); return; }
+      const w = Number(args[1] ?? 0.6);
+      const r = brain.defineTrait(ID, name, w);
+      line(r.ok ? `✔ 加上了「${r.name}」= ${r.weight}（现在共 ${r.total} 个维度）` : `✘ ${r.reason}`);
+      return;
+    }
+
     case 'say': {
       const flag = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
       const via = flag('--via') || 'auto';
@@ -524,7 +533,7 @@ async function run() {
     }
 
     default:
-      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve|vocab|say|mouth]');
+      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve|vocab|say|mouth|trait]');
   }
 }
 

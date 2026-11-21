@@ -4,7 +4,11 @@
 // 全部是纯函数：给定输入 → 确定输出。没有 IO，没有随机。
 
 export const WEIGHT_STEP = 0.01;      // 每次 ±0.01：100 次才显著 = "不知不觉"
-export const DAILY_DECAY = 0.999;     // 每天 ×0.999
+// 每天 ×DAILY_DECAY。这个数不是拍的——它决定"多久没人提，这条性格就掉了"。
+//   0.999   → 从 0.6 掉到 0.15 要 1386 天（3.8 年）→ 蜕皮永远不会发生
+//   0.9975  → 约 730 天（2 年）→ 和"记忆两年遗忘"同一个尺度
+// 人设淡忘不该比记忆慢：两年没人提的性格，就该沉进旧我。
+export const DAILY_DECAY = 0.9975;
 export const SHED_THRESHOLD = 0.15;   // 低于此值沉进 formerSelves
 
 const BRIEF_MAX_CHARS = 300;
@@ -102,12 +106,18 @@ export function speechProfile(traits = {}) {
     - 0.20 * g('嘴硬'),
   ));
 
+  // 独特的地方越多，越懒得解释（洁癖/工作狂那种人通常话少而直接）
+  const KNOWN = new Set(['嘴硬', '心软', '好奇', '好动', '敏感', '固执', '自信', '爱反思', '理性', '社交', '活泼', '懒']);
+  const customVals = Object.entries(traits || {}).filter(([k]) => !KNOWN.has(k)).map(([, v]) => Number(v) || 0);
+  const customShare = customVals.length ? customVals.reduce((a, b) => a + b, 0) / customVals.length : 0;
+  const finalVerbosity = Math.max(0.05, verbosity - 0.15 * customShare);
+
   // 话多 → brief 用满 300；话少 → 只有 130
-  const chars = Math.round(130 + 170 * verbosity);
-  const label = verbosity > 0.66 ? '话多' : verbosity > 0.36 ? '话一般' : '话少';
+  const chars = Math.round(130 + 170 * finalVerbosity);
+  const label = finalVerbosity > 0.66 ? '话多' : finalVerbosity > 0.36 ? '话一般' : '话少';
 
   return {
-    verbosity: Number(verbosity.toFixed(2)),
+    verbosity: Number(finalVerbosity.toFixed(2)),
     label,
     chars,
     // 给宿主/调试看的一句话，不进 brief

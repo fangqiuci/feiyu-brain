@@ -24,7 +24,7 @@ export const TRAIT_LEXICON = {
 };
 
 /** 角色卡里可以直接写：`性格：嘴硬=0.9 心软=0.6` —— 手写覆盖自动统计 */
-const HINT_RE = /^(?:性格|特质|traits)\s*[:：]\s*(.+)$/im;
+const HINT_RE = /^[\s#>*\-\d.、]*?(?:性格|特质|traits)\s*[:：]\s*(.+)$/im;
 
 /** 压缩指数：让"出现最多的特质"不至于把其余全部压到地板。
  *  1.0 = 原始比例（很极端）；0.7 = 感知上更接近"人都有一点"。 */
@@ -114,6 +114,8 @@ export function extractOpenTraits(cardText, { max = 8, known = null } = {}) {
     const word = stripAdverb(String(raw ?? '').trim());
     if (!word || word.length < 2 || word.length > 4) return;
     if (NOT_TRAIT.has(word)) return;
+    // 系动词碎片：「是鱼」「的鱼」这种不是性格
+    if (/^[是的了在有和与或个只把被]/.test(word)) return;
     if (knownTraitOf(word)) return;          // 归到已知维度了，不重复
     if (known && known[word] !== undefined) return;
     counts.set(word, (counts.get(word) ?? 0) + 1);

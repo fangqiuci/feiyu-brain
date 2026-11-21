@@ -244,6 +244,15 @@ export class DryDriver {
  * @param {object} body   createBody() 的结果
  * @param {object} [opts] { adbPath, deviceId, evidenceDir }
  */
+function hasAdbDevice() {
+  try {
+    const out = require('node:child_process').execFileSync('adb', ['devices'], { timeout: 2000, encoding: 'utf8' });
+    return /\tdevice\b/.test(out);
+  } catch {
+    return false; // 没装 adb / 没设备
+  }
+}
+
 export function driverFor(body, opts = {}) {
   if (!body) return new DryDriver();
   if (body.kind === 'phone' || body.kind === 'tablet' || body.emulated) {

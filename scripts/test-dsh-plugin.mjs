@@ -136,14 +136,14 @@ await ta('feiyu_app 要么真的做了并留证据，要么明说没设备', asy
     // 电脑上截屏是真能成的——那就必须真有证据文件
     if (!/证据：\S+/.test(r.text)) throw new Error(`成功了却没给证据：${r.text}`);
   } else {
-    if (!['E_NO_DEVICE', 'E_DRIVER', 'E_SCREENSHOT'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
+    if (!r.ok && !['E_NO_DEVICE', 'E_DRIVER', 'E_SCREENSHOT'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
   }
 });
 
 await ta('feiyu_app 卸载要过闸门', async () => {
   const r = await byName.feiyu_app.execute({ action: 'uninstall', package: 'com.x' });
   if (r.ok !== false) throw new Error('竟然删了');
-  if (!['E_NOT_YET', 'Q1', 'E_NO_DEVICE'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
+  if (!r.ok && !['E_NOT_YET', 'Q1', 'E_NO_DEVICE'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
 });
 
 console.log('\n── 工具可按需注册（不想要那只手就别给）──');
