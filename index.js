@@ -2008,6 +2008,29 @@ export async function speak(id = DEFAULT_ID, event = {}, { mouth = null, section
 }
 
 export function snapshot(id = DEFAULT_ID) {
+  // 崩在宿主里 = 她一句话都发不出来。所以这里一律兜住，给人话。
+  // 但"坏档"不是"没卡"：坏档必须喊出来，绝不能当空壳继续跑。
+  try {
+    return snapshotInner(id);
+  } catch (e) {
+    if (e && e.code === 'E_BRAIN_CORRUPT') throw e;
+    return {
+      ok: false,
+      code: 'E_NO_CARD',
+      text: '找不到角色卡：她还没有人设，所以现在只是个空壳。',
+      guide: {
+        step1: '写一张卡：~/.feiyu-brain/roles/<名字>.md（第一行写你是谁，后面一行一条：性格、说话方式、不能做什么）',
+        step2: 'npx feiyu lint   —— 检查卡有没有写歪',
+        step3: 'npx feiyu status —— 再来看她',
+      },
+      detail: String(e?.message ?? e).slice(0, 160),
+      dataDir: dataDir(),
+      roleDir: roleDir(),
+    };
+  }
+}
+
+function snapshotInner(id = DEFAULT_ID) {
   const brain = ensureBrain(id);
   const level = flowLevel(brain.state, { boredom: brain.drive.boredom });
   return {

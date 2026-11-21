@@ -207,16 +207,53 @@ export function listBrains() {
 
 export function loadBrain(id) {
   const file = brainFile(id);
+  const mainExists = fs.existsSync(file);
   let main = readJson(file, null);
+  let recovered = false;
+
   if (!main) {
     // 主文件坏了就退到备份——单文件损坏不该等于丢档
     const bak = readJson(`${file}.bak`, null);
     if (bak) {
       main = bak;
+      recovered = true;
       try { writeJsonAtomic(file, bak); } catch { /* 修不回来也不影响这次读 */ }
     }
   }
-  if (!main) return null;
+
+  // ── 双损坏：绝不静默重生 ────────────────────────────────────
+  //
+  // 一次磁盘抖动 + 一次写中断，就会让主档和备份同时坏。
+  // 如果这时候还照常"找不到就出生"，她会**换一个灵魂**，而且没人知道。
+  //
+  // 所以：坏档先隔离、留证据，然后**喊出来**。
+  if (!main) {
+    const hasHistory = mainExists
+      || fs.existsSync(`${file}.bak`)
+      || (() => { try { return fs.readdirSync(yearsDir(id)).length > 0; } catch { return false; } })();
+
+    if (hasHistory) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const broken = `${file}.broken-${stamp}`;
+      try { if (mainExists) fs.renameSync(file, broken); } catch { /* 隔离失败也要继续喊 */ }
+      try { if (fs.existsSync(`${file}.bak`)) fs.copyFileSync(`${file}.bak`, `${broken}.bak`); } catch { /* 同上 */ }
+      const err = new Error(
+        `大脑档案损坏，已隔离到 ${broken}。\n`
+        + '她的经历（years/ 分片）还在，但人设和关系读不出来了。\n'
+        + '不要急着重开：先看 npx feiyu doctor，或从快照恢复 npx feiyu restore <快照名>。',
+      );
+      err.code = 'E_BRAIN_CORRUPT';
+      err.quarantinedTo = broken;
+      throw err;
+    }
+    return null; // 真·第一次：没有任何历史痕迹，正常出生
+  }
+
+  if (recovered) {
+    const err = { recovered: true, from: `${file}.bak` };
+    // 不抛错，但要让调用方知道这次是"捡回来的"
+    main.__recoveredFrom = err.from;
+  }
 
   // ── 把窗口内的年份读回内存（更早的留在磁盘上，不加载）──
   main.memory = main.memory ?? {};

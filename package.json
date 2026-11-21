@@ -1,6 +1,6 @@
 {
   "name": "feiyu-brain",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "给 AI 装一颗有记忆、有情绪、会变化的脑；带上嘴（外接 OneBot/官方）和手（点、打、滑、执行）。",
   "type": "module",
   "license": "MIT",

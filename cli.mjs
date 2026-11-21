@@ -441,7 +441,7 @@ async function run() {
           line('  或者手工指定：npx feiyu say --via onebot --base http://127.0.0.1:3000 --token xxx');
           return;
         }
-        C.saveChannels(brain.dataDir(), found.map(({ impl, implName, baseUrl, token, uin, nickname }) => ({ impl, implName, baseUrl, token, uin, nickname })));
+        C.saveChannels(brain.dataDir(), found.map(({ impl, implName, baseUrl, token, uin, nickname, file }) => ({ impl, implName, baseUrl, token, file, uin, nickname })));
         line(`✔ 找到 ${found.length} 个，已记住`);
         for (const f of found) line(`  ${f.implName.padEnd(16)} ${f.baseUrl}  ${f.uin ?? ''} ${f.nickname ?? ''}`);
         return;
@@ -461,7 +461,7 @@ async function run() {
 
     case 'say': {
       const flag = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
-      const via = flag('--via') || 'window';
+      const via = flag('--via') || 'auto';
       const target = flag('--target') || flag('--to') || '';
       const skip = new Set(['--via', '--target', '--to', '--kind', '--base', '--token']);
       const words = [];
@@ -483,6 +483,8 @@ async function run() {
         kind: flag('--kind') || 'group',
         baseUrl: flag('--base') || '',
         token: flag('--token') || '',
+        dataDir: brain.dataDir(),
+        allowDirect: true, // 用户在命令行亲口说要发，算显式授权
       });
       if (!r.ok) {
         line(`✘ ${r.code}: ${r.text}`);
