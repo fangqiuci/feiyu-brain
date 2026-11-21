@@ -83,7 +83,7 @@ function isNoCard(e) {
   return /找不到角色卡/.test(String(e?.message ?? e));
 }
 
-function run() {
+async function run() {
   const cmd = rawCmd || 'status';
 
   switch (cmd) {
@@ -156,6 +156,249 @@ function run() {
       return;
     }
 
+    case 'snapshot': {
+      const r = brain.snapshotBrain(ID, args[0]);
+      line(`已存档：${r.name}`);
+      line(r.file);
+      return;
+    }
+
+    case 'restore': {
+      const r = brain.restoreBrain(ID, args[0]);
+      if (!r.ok) {
+        line(`✘ ${r.reason}`);
+        if (r.available?.length) line(`可用：${r.available.join(', ')}`);
+        return;
+      }
+      line(`已退回 ${r.restored}`);
+      line(`体检：${r.check.verdict}`);
+      return;
+    }
+
+    case 'snapshots': {
+      const list = brain.listSnapshots(ID);
+      if (!list.length) { line('还没有快照。'); return; }
+      for (const s of list) line(`  ${s.name}  ${(s.size / 1024).toFixed(1)} KB`);
+      return;
+    }
+
+    case 'lint': {
+      const file = args[0];
+      let text = '';
+      if (file && fs.existsSync(file)) {
+        text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+      } else {
+        const card = brain.resolveRoleCard();
+        if (!card?.text) { line('没有卡可体检；用法：npx feiyu lint <卡的路径>'); return; }
+        text = card.text;
+        line(`（体检当前卡：${card.file}）`);
+        line();
+      }
+      const r = brain.lintCard(text);
+      line(`可抽成命题 ${r.units} 条：${Object.entries(r.byKind).map(([k, v]) => `${k} ${v}`).join(' / ') || '无'}`);
+      line(`被忽略 ${r.dropped.length} 行`);
+      line();
+      line('命题预览：');
+      for (const p of r.preview) line(`  ${p}`);
+      if (r.suggestSplit.length) {
+        line();
+        line(`⚠️ 有 ${r.suggestSplit.length} 行更像操作手册，建议拆出人设：`);
+        for (const s of r.suggestSplit.slice(0, 10)) line(`  · ${s.text}`);
+      }
+      return;
+    }
+
+    case 'import': {
+      const file = args[0];
+      if (!file || !fs.existsSync(file)) { line('用法：npx feiyu import <episodes.json>'); return; }
+      const list = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+      const r = brain.importEpisodes(ID, Array.isArray(list) ? list : list.episodes);
+      line(`导入了 ${r.imported} 条（跳过 ${r.skipped}），现在共 ${r.total} 条经历。`);
+      return;
+    }
+
+    case 'migrate': {
+      const target = args[0];
+      if (!target || !fs.existsSync(target)) {
+        line('用法：npx feiyu migrate <文件或目录> [选项]');
+        line('');
+        line('  --all            整个目录一起搬（自动认格式）');
+        line('  --format jsonl|days|generic   只对单个文件生效');
+        line('  --dry-run        只看会搬多少，不写');
+        line('  --delete-source  搬完把原文件改名成 .migrated（不是删除）');
+        line('');
+        line('支持的格式：');
+        line('  jsonl    一行一条 {"sender":"谁","text":"说了什么","time":时间戳}');
+        line('  days     日记式 markdown：- 某人：说了什么');
+        line('  generic  JSON 数组');
+        return;
+      }
+
+      const flag = (f) => {
+        const i = args.indexOf(f);
+        return i >= 0 ? args[i + 1] : undefined;
+      };
+      const dryRun = args.includes('--dry-run');
+      const deleteSource = args.includes('--delete-source');
+      const all = args.includes('--all') || fs.statSync(target).isDirectory();
+
+      const sniff = (f) => {
+        if (/\.jsonl$/i.test(f)) return 'jsonl';
+        if (/\.(md|txt)$/i.test(f)) return 'days';
+        if (/\.json$/i.test(f)) return 'generic';
+        return 'jsonl';
+      };
+      const collect = (p) => {
+        const st = fs.statSync(p);
+        if (!st.isDirectory()) return [p];
+        const out = [];
+        for (const name of fs.readdirSync(p)) {
+          const full = path.join(p, name);
+          if (fs.statSync(full).isDirectory()) out.push(...collect(full));
+          else if (/\.(md|jsonl|json|txt)$/i.test(name) && !name.endsWith('.migrated')) out.push(full);
+        }
+        return out.sort();
+      };
+
+      const files = collect(target);
+      if (!files.length) { line('这个目录里没有 .md / .jsonl / .json 可搬。'); return; }
+
+      if (!all) {
+        // 单文件：沿用原来的行为
+        const file = files[0];
+        const format = flag('--format') ?? sniff(file);
+        const text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+        const r = brain.migrateMemory(ID, { text, format, dryRun });
+        const p = r.report;
+        line(`格式 ${p.format}　解析出 ${p.parsed} 条　重复 ${p.duplicated} 条　将导入 ${p.willImport} 条`);
+        if (p.span) line(`时间跨度 ${p.span.from} → ${p.span.to}`);
+        if (p.parseErrorCount) {
+          line(`跳过 ${p.parseErrorCount} 行：`);
+          for (const e of p.parseErrors.slice(0, 5)) line(`  第 ${e.line} 行 ${e.reason}`);
+        }
+        if (dryRun) { line(''); line('（dry-run，什么都没写。去掉 --dry-run 才真搬）'); return; }
+        line('');
+        line(`✔ 导入了 ${r.imported} 条，现在共 ${r.total} 条经历。`);
+        line(`体检：${brain.identityCheck(ID).verdict}`);
+        return;
+      }
+
+      // 全量整合
+      const sources = files.map((f) => ({ path: f, text: fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, ''), format: sniff(f) }));
+      const r = brain.migrateAll(ID, sources, { dryRun, deleteSource });
+      const p = r.report;
+      line(`扫到 ${p.files} 个文件　解析出 ${p.parsed} 条　重复 ${p.duplicated} 条　将导入 ${p.willImport} 条`);
+      if (p.span) line(`时间跨度 ${p.span.from} → ${p.span.to}`);
+      if (p.errorCount) {
+        line(`跳过 ${p.errorCount} 处：`);
+        for (const e of p.errors.slice(0, 5)) line(`  ${path.basename(e.path || '?')} 第 ${e.line} 行 ${e.reason}`);
+      }
+      if (dryRun) {
+        line('');
+        line('（dry-run，什么都没写）');
+        line('真搬：去掉 --dry-run；想连原文件一起收走，加 --delete-source（改名 .migrated，不是删）');
+        return;
+      }
+      line('');
+      line(`✔ 全量导入 ${r.imported} 条，现在共 ${r.total} 条经历。`);
+      if (r.compacted) line(`  容量保护：最老的 ${r.compacted} 条已压成卡片 + 归档`);
+      if (r.renamed.length) {
+        line(`  原文件已改名 ${r.renamed.length} 个：`);
+        for (const n of r.renamed.slice(0, 5)) line(`    ${path.basename(n)}`);
+      }
+      line(`体检：${r.check.verdict}`);
+      line('');
+      line('自检：npx feiyu verify');
+      return;
+    }
+
+    case 'verify': {
+      const r = brain.verifyMemory(ID);
+      line(`经历 ${r.episodes} 条（亲历 ${r.live} / 搬来 ${r.imported}）　卡片 ${r.cards}　认识 ${r.people} 个人`);
+      line(`体检：${r.check.verdict}`);
+      line(`回忆抽检：${Math.round(r.recallRate * 100)}%（${r.recall.filter((c) => c.found).length}/${r.recall.length}）`);
+      for (const c of r.recall) line(`  ${c.found ? '✔' : '✘'} 「${c.keyword}」`);
+      return;
+    }
+
+    case 'diary': {
+      const sub = args[0] || 'digest';
+      if (sub === 'write') {
+        const file = args[1];
+        if (!file || !fs.existsSync(file)) { line('用法：npx feiyu diary write <文本文件> [YYYY-MM-DD]'); return; }
+        const r = brain.writeDiary(ID, { date: args[2], text: fs.readFileSync(file, 'utf8') });
+        if (!r.ok) { line(`✘ ${r.reason}`); return; }
+        line(`${r.date} 的日记存好了（${r.chars} 字）`);
+        line(r.file);
+        return;
+      }
+      if (sub === 'read') {
+        const r = brain.readDiary(ID, args[1]);
+        if (!r) { line(`${args[1] || '今天'}还没有日记。`); return; }
+        line(r.text);
+        return;
+      }
+      if (sub === 'list') {
+        const list = brain.listDiary(ID);
+        if (!list.length) { line('还没写过日记。'); return; }
+        for (const d of list) line(`  ${d.date}  ${(d.size / 1024).toFixed(1)} KB`);
+        return;
+      }
+      const d = brain.diaryDigest(ID, args[1]);
+      line(`【${d.date} 的素材】经历 ${d.episodes} 条，见了 ${d.people.length ? d.people.join('、') : '没人'}，心情 ${d.mood || '平静'}`);
+      line();
+      line(d.draft);
+      line();
+      line(`👉 ${d.hint}`);
+      return;
+    }
+
+    case 'doctor': {
+      const { diagnose, applyFixes, formatReport } = await import('./lib/doctor.mjs');
+      const profile = args[0] || 'desktop';
+      const report = diagnose({ profile });
+      line(formatReport(report));
+      if (args.includes('--fix')) {
+        line('');
+        const done = applyFixes(report);
+        if (done.length) {
+          for (const d of done) line(`✔ ${d}`);
+          line('');
+          line('改完了。**完全退出 DSH 再启动**（宿主需要冷启动才认新 bundles）。');
+        } else {
+          line('没有能自动修的项。');
+        }
+      } else if (!report.ok) {
+        line('');
+        line('能自动修的加 --fix：npx feiyu doctor --fix（会改 profile 的 bundles 和工具白名单）');
+      }
+      return;
+    }
+
+    case 'serve': {
+      const { serve } = await import('./lib/serve.mjs');
+      const flag = (f) => {
+        const i = args.indexOf(f);
+        return i >= 0 ? args[i + 1] : undefined;
+      };
+      const port = Number(flag('--port') ?? 7788);
+      const token = flag('--token') ?? process.env.FEIYU_TOKEN ?? '';
+      const host = flag('--host') ?? '127.0.0.1';
+      const s = await serve(brain, { port, host, token, id: ID });
+      line(`边车起来了：${s.url}`);
+      line(`鱼：${ID}　 token：${token ? '已设（要求 x-feiyu-token 头）' : '没设（只允许本机）'}`);
+      line('');
+      line('Python 这么接：');
+      line(`  requests.post('${s.url}/wake', json={'id':'${ID}','sender':who,'text':msg})`);
+      line('');
+      line('接口：GET /health /status /version /identity /verify');
+      line('      POST /wake /observe /feel /diary /migrate /snapshot');
+      line('Ctrl+C 停。');
+      // 常驻
+      await new Promise(() => {});
+      return;
+    }
+
     case 'body': {
       const kind = args[0];
       const s = brain.snapshot(ID);
@@ -186,12 +429,12 @@ function run() {
     }
 
     default:
-      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth]');
+      line('用法：npx feiyu [status|brief|observe|settle|audit|spread|body|rebirth|snapshot|restore|snapshots|lint|import|migrate|verify|diary|doctor|serve]');
   }
 }
 
 try {
-  run();
+  await run();
 } catch (e) {
   if (isNoCard(e)) {
     firstRunGuide();

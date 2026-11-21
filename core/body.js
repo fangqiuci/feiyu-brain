@@ -62,7 +62,7 @@ export const DEFAULT_SCOPE = {
  * @param {'phone'|'tablet'|'desktop'} opts.kind
  * @param {'owned'|'borrowed'|'emulator'} [opts.ownership]
  */
-export function createBody({ kind, ownership = 'owned', apps, scope } = {}) {
+export function createBody({ kind, ownership = 'owned', apps, scope, owner = 'brain' } = {}) {
   if (!BODY_KINDS.includes(kind)) {
     throw new Error(`身体只能是 ${BODY_KINDS.join(' / ')}`);
   }
@@ -70,6 +70,8 @@ export function createBody({ kind, ownership = 'owned', apps, scope } = {}) {
   return {
     kind,
     ownership,
+    // 谁负责真的去动这台设备：'brain'（脑自己开 App）或 'host'（宿主已有 qq_phone_device 这类工具）
+    owner: owner === 'host' ? 'host' : 'brain',
     label: profile.label,
     screen: profile.screen,
     posture: profile.posture,
@@ -92,6 +94,16 @@ export function hasCapability(body, level) {
 export function canDo(body, action = {}) {
   if (!body) return { ok: false, code: 'E_NO_BODY', reason: '没有身体，想而不得' };
   if (body.online === false) return { ok: false, code: 'E_OFFLINE', reason: `${body.label}没联网` };
+
+  // 设备归宿主管时，脑不抢——两套都能动设备，谁先谁后必须有个约定。
+  // 宿主确实要脑来动手时，显式传 force:true（等于宿主当场授权）。
+  if (body.owner === 'host' && action.force !== true && action.type && action.type !== 'screenshot') {
+    return {
+      ok: false,
+      code: 'E_HOST_OWNS',
+      reason: '这台设备归宿主管（body.owner=host）；要脑动手请显式 force:true',
+    };
+  }
 
   const need = action.capability ?? CAPABILITY.OPERATE;
   if (need === CAPABILITY.MONEY && !action.approved) {

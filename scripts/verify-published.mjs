@@ -15,8 +15,10 @@ import { pathToFileURL } from 'node:url';
 const NAME = 'feiyu-brain';
 const want = process.argv[2] ?? null;
 
-const registry = `https://registry.npmjs.org/${NAME}`;
-const meta = await (await fetch(registry)).json();
+// 必须带 cache-buster：npm 的 CDN 会缓存整份 metadata，
+// 刚发布的版本不带 ?x= 会读到旧目录，验出来的是上一版（1.4.2 那次就踩过）。
+const registry = `https://registry.npmjs.org/${NAME}?x=${Date.now()}`;
+const meta = await (await fetch(registry, { headers: { 'cache-control': 'no-cache' } })).json();
 if (!meta?.versions) {
   console.error('❌ registry 上查不到这个包');
   process.exit(1);

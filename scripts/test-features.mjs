@@ -377,10 +377,77 @@ await t('换人格卡 → 口味跟着换回来', () => {
   assert.ok(afterTaste < beforeTaste, `解压口味 ${beforeTaste} → ${afterTaste}`);
 });
 
+console.log('\n── 1.5：可裁剪 / 可只读 / 可搬家 ──');
+
+const card5 = '你是测试鱼五号。\n性格：嘴硬=0.8 心软=0.5 好奇=0.6\n- 我嘴硬，被怼会顶回去。\n- 不要客服腔。';
+const fy5 = brain.createBrain({ id: 'v15', dataDir: tmp, roleDir: roles, cardText: card5, cardName: '五号', relation: 'parent', address: '老爹' });
+
+await t('wake 只点 mood 时，不出人设段', () => {
+  fy5.feel({ valence: -0.7, intensity: 0.6 });
+  const full = brain.wakeLine('v15', { who: 'A' });
+  const only = brain.wakeLine('v15', { who: 'A' }, { sections: ['mood'] });
+  assert.ok(full.includes('【此刻的她】'));
+  assert.ok(!only.includes('【此刻的她】'), only);
+  assert.ok(only.length < full.length / 3, `${only.length} vs ${full.length}`);
+});
+
+await t('budget 超了就砍，人设保底不砍', () => {
+  const tiny = brain.wakeLine('v15', { who: 'A', text: '你嘴真硬' }, { budget: 60 });
+  assert.ok(tiny.includes('【此刻的她】'), '人设被砍掉了');
+  assert.ok(tiny.length <= 400, tiny.length);
+});
+
+await t('observe({evolve:false}) 只记经历，权重不动', () => {
+  const before = fy5.brain.persona.units.map((u) => u.weight).join(',');
+  const r = brain.observe('v15', { who: 'A', text: '我嘴硬，被怼会顶回去', what: '我嘴硬，被怼会顶回去' }, { evolve: false });
+  assert.equal(r.evolved, false);
+  const after = fy5.brain.persona.units.map((u) => u.weight).join(',');
+  assert.equal(after, before, '权重被改了');
+  assert.ok(fy5.brain.memory.episodes.length > 0, '经历没记下来');
+});
+
+await t('observe({evolve:false}) 连特质漂移也关掉', () => {
+  const before = fy5.brain.persona.traits.懒;
+  brain.observe('v15', { app: 'douyin', kind: '解压', reaction: 1, text: '解压视频' }, { evolve: false });
+  assert.equal(fy5.brain.persona.traits.懒, before, '只当记忆库时不该偷偷改人设');
+});
+
+await t('identityCheck：新鱼是「像她但不是她」，有过往之后是「是她」', () => {
+  const fresh = brain.createBrain({ id: 'v15b', dataDir: tmp, roleDir: roles, cardText: card5, cardName: '六号', relation: 'parent', address: '老爹' });
+  const a = brain.identityCheck('v15b');
+  assert.equal(a.verdict, '像她，但不是她');
+  fresh.observe({ who: 'A', text: '在吗' });
+  const b = brain.identityCheck('v15b');
+  assert.equal(b.verdict, '是她');
+  assert.ok(b.memory.episodes >= 1);
+});
+
+await t('脑包：导出去再装回来，还是她', () => {
+  const pack = brain.exportPack('v15');
+  assert.equal(pack.format, 'feiyu-brainpack/1');
+  const before = brain.identityCheck('v15');
+  const r = brain.importPack(pack, { id: 'v15copy' });
+  assert.equal(r.ok, true);
+  const after = brain.identityCheck('v15copy');
+  assert.equal(after.verdict, before.verdict);
+  assert.equal(after.memory.episodes, before.memory.episodes);
+  assert.equal(after.relation.address, '老爹');
+});
+
+await t('脑包：格式不对就拒收，不假装兼容', () => {
+  const r = brain.importPack({ format: 'tavern/v2', persona: { units: [] } });
+  assert.equal(r.ok, false);
+});
+
+await t('脑包：没有命题的包也拒收', () => {
+  const r = brain.importPack({ format: 'feiyu-brainpack/1', persona: { units: [] } });
+  assert.equal(r.ok, false);
+});
+
 console.log('');
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 if (fails.length) {
   console.log(`✘ ${fails.length} 项失败`);
   process.exit(1);
 }
-console.log(`✔ 1.4.0 新能力全部可用（${pass}/${pass}）`);
+console.log(`✔ 1.5.0 新能力全部可用（${pass}/${pass}）`);

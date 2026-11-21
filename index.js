@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { birthFromCard } from './core/extract.js';
+import { birthFromCard, lintCard } from './core/extract.js';
 import { brief, decay, evolve, shed, weightReport } from './core/persona.js';
 import { styleVector, flowLevel, flowName, hashTraits, mulberry32 } from './core/derive.js';
 import { createBody, chooseBody, bodyLine, canDo, hasCapability, CAPABILITY, BODY_KINDS, BODY_PROFILES, recordAction } from './core/body.js';
@@ -21,6 +21,8 @@ import { check } from './core/invariants.js';
 import { toCue, toObservation, shouldObserve, normalizeEvent } from './core/event.js';
 import * as emotion from './core/emotion.js';
 import { makeCard, addCard, shouldCompact } from './core/memory.js';
+import { parseAny, dedupe, MIGRATE_FORMATS } from './core/migrate.js';
+import { dayKey, dayDigest } from './core/diary.js';
 import { driverFor } from './core/driver.js';
 import {
   recordSeen, recallApp, appTaste, appSummary, similarSeen, emptyApps,
@@ -28,11 +30,16 @@ import {
 } from './core/apps.js';
 import {
   ROOT, loadBrain, saveBrain, appendAudit, readAudit, listBrains,
-  setDataDir, setRoleDir, dataDir, roleDir,
+  setDataDir, setRoleDir, dataDir, roleDir, brainDir, dataDirSource, isDataDirInsidePackage,
 } from './store.js';
 
 const DEFAULT_ID = 'default';
 const cache = new Map();
+
+/* 全局开关（configure 改） */
+let shadowMode = false;        // 影子模式：只写 audit，不动权重、不落盘
+let ttlPolicy = 'hard';        // hard | summarize | archive | off
+let moodPolicy = 'brain';      // 情绪双源：brain（脑说了算）| host（宿主说了算）| blend（各一半）
 
 function nowMs() {
   return Date.now();
@@ -46,10 +53,67 @@ function logOnce(msg) {
   try { console.warn(msg); } catch { /* 没有 console 也不影响 */ }
 }
 
-/** 宿主初始化：指定数据目录和角色卡目录 */
-export function configure({ dataDir: d, roleDir: r } = {}) {
+/**
+ * 宿主初始化：指定数据目录和角色卡目录。
+ *
+ *   configure({ dataDir, roleDir })
+ *   configure({ shadow: true })      影子模式：observe 只留审计，不动人设、不落盘
+ *   configure({ ttlPolicy: 'off' })  hard(默认) | summarize(过期前压卡片) | off(永不遗忘)
+ */
+export function configure({ dataDir: d, roleDir: r, shadow, ttl, mood } = {}) {
   if (d) setDataDir(d);
   if (r) setRoleDir(r);
+  if (typeof shadow === 'boolean') shadowMode = shadow;
+  if (ttl && ['hard', 'summarize', 'archive', 'off'].includes(ttl)) ttlPolicy = ttl;
+  if (mood && ['brain', 'host', 'blend'].includes(mood)) moodPolicy = mood;
+}
+
+export function runtimeOptions() {
+  return {
+    shadow: shadowMode,
+    ttlPolicy,
+    moodPolicy,
+    dataDir: dataDir(),
+    dataDirSource: dataDirSource(),
+    dataDirInsidePackage: isDataDirInsidePackage(),
+    roleDir: roleDir(),
+  };
+}
+
+/**
+ * 情绪双源仲裁。
+ *
+ * 宿主往往已经有自己的情绪系统（比如 state/emotion.json）。两边都能改情绪时必须定个优先级：
+ *
+ *   brain （默认）  宿主推过来的直接忽略，脑说了算
+ *   host          情绪以宿主为准，`feel()` 只算不写
+ *   blend         各占一半
+ */
+export function syncMood(id = DEFAULT_ID, pad = [], { policy } = {}) {
+  const brain = ensureBrain(id);
+  const p = ['brain', 'host', 'blend'].includes(policy) ? policy : moodPolicy;
+  const host = [0, 1, 2].map((i) => {
+    const v = Number(pad?.[i]);
+    return Number.isFinite(v) ? Math.max(-1, Math.min(1, v)) : 0;
+  });
+
+  if (p === 'brain') {
+    return { ok: true, ignored: true, policy: p, affect: brain.affect };
+  }
+
+  const cur = [Number(brain.affect?.p) || 0, Number(brain.affect?.a) || 0, Number(brain.affect?.d) || 0];
+  const next = p === 'host' ? host : cur.map((c, i) => Number(((c + host[i]) / 2).toFixed(4)));
+
+  brain.affect = {
+    ...brain.affect,
+    p: next[0],
+    a: next[1],
+    d: next[2],
+    moodSource: p,
+  };
+  saveBrain(brain);
+  appendAudit(id, { kind: 'mood-sync', policy: p, pad: next });
+  return { ok: true, ignored: false, policy: p, affect: brain.affect };
 }
 
 /** 读角色卡：优先显式名字，否则读 state/current-role.json。 */
@@ -138,7 +202,13 @@ export function birth({ id = DEFAULT_ID, relation = 'parent', address = '', card
     // 身体：手机 / 平板 / 电脑。没指定就按人设算——好动的摸手机，爱折腾的开电脑。
     body: createBody({ kind: body ?? chooseBody(traits, {}, mulberry32(hashTraits(traits))) }),
     patience: 1,
-    meta: { lastSettle: nowMs(), observations: 0, version: '1.1.0' },
+    meta: {
+      lastSettle: nowMs(),
+      observations: 0,
+      version: '1.5.0',
+      shadow: shadowMode,
+      contractWarnings: [],
+    },
   };
 
   brain.self.styleName = dominantStyle(brain.self.style);
@@ -171,39 +241,77 @@ export function getBrief(id = DEFAULT_ID) {
  * 接受两种入参：
  *   - 通用事件 { sender, text, ... }
  *   - 线索 { who, words }
+ *
+ * 第三参数用来"点菜"——叠加到别人已有的系统里时，只取你要的那几段：
+ *
+ *   wakeLine(id, cue)                                  // 全给（默认）
+ *   wakeLine(id, cue, { sections: ['mood'] })          // 只要心情，约 20 字
+ *   wakeLine(id, cue, { sections: ['mood','memory'], budget: 300 })
+ *
+ * sections 可选：persona / flow / body / mood / memory / search
+ * budget 是**总字数上限**，超了就从低优先级的段开始砍（persona 保底不砍）。
  */
-export function wakeLine(id = DEFAULT_ID, eventOrCue = null) {
+export const WAKE_SECTIONS = ['persona', 'flow', 'body', 'mood', 'memory', 'search'];
+/** 预算不够时的砍法：越靠后越先砍 */
+const WAKE_PRIORITY = ['persona', 'mood', 'flow', 'memory', 'body', 'search'];
+
+export function wakeLine(id = DEFAULT_ID, eventOrCue = null, opts = {}) {
   const brain = ensureBrain(id);
   if (!brain.persona.brief) refreshBrief(brain);
 
+  const want = Array.isArray(opts?.sections) && opts.sections.length
+    ? new Set(opts.sections.filter((s) => WAKE_SECTIONS.includes(s)))
+    : new Set(WAKE_SECTIONS);
+  const budget = Number.isFinite(opts?.budget) ? Number(opts.budget) : Infinity;
+
   const level = flowLevel(brain.state, { boredom: brain.drive.boredom });
   brain.state.flow = level;
-  const parts = [`【此刻的她】${brain.persona.brief}`];
-  const bodyText = bodyLine(brain.body);
-  if (bodyText) parts.push(`【手上的东西】${bodyText}`);
 
-  if (level !== 1) parts.push(`【意识流】${flowName(level)}`);
+  const seg = { persona: `【此刻的她】${brain.persona.brief}` };
+  if (level !== 1) seg.flow = `【意识流】${flowName(level)}`;
+
+  const bodyText = bodyLine(brain.body);
+  if (bodyText) seg.body = `【手上的东西】${bodyText}`;
+
+  // 心情段：还没学会词的时候不能说"不知道"，要给出身体感受——
+  // 否则只要心情的宿主会拿到一个空段。
   const mood = brain.affect?.mood;
-  if (mood && mood !== '平静' && mood !== '说不上来') parts.push(`【心情】${mood}`);
+  if (mood && mood !== '平静') {
+    seg.mood = mood === '说不上来'
+      ? `【心情】${emotion.describeSensation([brain.affect.p ?? 0, brain.affect.a ?? 0, brain.affect.d ?? 0])}`
+      : `【心情】${mood}`;
+  }
 
   const cue = eventOrCue?.who !== undefined ? eventOrCue : toCue(eventOrCue);
   if (cue) {
     const hit = retrieve(cue, brain.memory);
-    if (hit.text) parts.push(`【想到的】\n${hit.text}`);
+    if (hit.text) seg.memory = `【想到的】\n${hit.text}`;
 
     // 外部检索器（向量/图谱）：同步读缓存，不 await
     if (extraRetriever) {
       try {
         const extra = extraRetriever(cue, brain.memory) ?? [];
         const lines = (Array.isArray(extra) ? extra : []).filter(Boolean).slice(0, 3);
-        if (lines.length) parts.push(`【搜到的】\n${lines.join('\n')}`);
+        if (lines.length) seg.search = `【搜到的】\n${lines.join('\n')}`;
       } catch (e) {
         // 检索器坏了不能拖垮唤醒
         logOnce(`[brain] 外部检索器出错（已忽略）：${e?.message ?? e}`);
       }
     }
   }
-  return parts.join('\n');
+
+  const out = [];
+  let used = 0;
+  for (const key of WAKE_PRIORITY) {
+    if (!want.has(key)) continue;
+    const text = seg[key];
+    if (!text) continue;
+    // persona 是根，再穷也得给；其余按预算砍
+    if (key !== 'persona' && used + text.length > budget) continue;
+    out.push(text);
+    used += text.length;
+  }
+  return out.join('\n');
 }
 
 /**
@@ -211,10 +319,18 @@ export function wakeLine(id = DEFAULT_ID, eventOrCue = null) {
  *
  *   event = { sender, text, ... }               ← 适配器直接传
  *   event = { consistent, conflicting, ... }    ← 高级用法
+ *
+ * 第三参数 opts：
+ *   evolve   = true   记经历的同时，改人设权重（默认）
+ *            = false  **只记经历，不碰人设** —— 叠加到别人已有的人格系统时用这个，
+ *                     免得两套各说各话、token 翻倍
+ *   remember = true   写进记忆（默认）
  */
-export function observe(id = DEFAULT_ID, event = {}) {
+export function observe(id = DEFAULT_ID, event = {}, opts = {}) {
   const brain = ensureBrain(id);
   const at = nowMs();
+  const doEvolve = opts?.evolve !== false;
+  const doRemember = opts?.remember !== false;
 
   const ev = event.consistent || event.conflicting || !event.sender
     ? event
@@ -223,17 +339,57 @@ export function observe(id = DEFAULT_ID, event = {}) {
   const consistent = ev.consistent ?? matchUnits(brain.persona.units, ev.text ?? '').consistent;
   const conflicting = ev.conflicting ?? matchUnits(brain.persona.units, ev.text ?? '').conflicting;
 
+  // ── 影子模式 ──
+  // 只写审计，不动人设、不进记忆、不落盘。
+  // 宿主可以拿它试跑一百次，确认"会长成什么样"，再决定要不要真接。
+  // 全局开关和这条鱼自己的标记都算数——生下来之后才打开 shadow 也应该生效。
+  if (shadowMode || brain.meta.shadow) {
+    const would = brain.persona.units
+      .filter((u) => consistent.includes(u.id) || conflicting.includes(u.id))
+      .map((u) => ({
+        id: u.id,
+        from: Number(u.weight.toFixed(3)),
+        to: Number(Math.max(0, Math.min(1, u.weight + (consistent.includes(u.id) ? 1 : -1) * 0.01)).toFixed(3)),
+      }));
+    appendAudit(id, {
+      kind: 'shadow',
+      shadow: true,
+      at,
+      text: String(ev.text ?? ev.what ?? '').slice(0, 80),
+      wouldChange: would,
+    });
+    return {
+      brain, consistent, conflicting, label: null, shadow: true, evolved: false, remembered: false, wouldChange: would,
+    };
+  }
+
   // step：默认 1（每次 ±0.01）。只有传了 magnitude（重大转折）才放大，上限 5。
   const step = Math.max(1, Math.min(5, Number(ev.magnitude) || 1));
-  brain.persona.units = evolve(brain.persona.units, { consistent, conflicting, at, step });
+  if (doEvolve) {
+    brain.persona.units = evolve(brain.persona.units, { consistent, conflicting, at, step });
 
-  // 蜕皮
-  const sh = shed(brain.persona.units, { at });
-  if (sh.formerSelves.length) {
-    brain.persona.units = sh.units;
-    brain.memory.formerSelves.push(...sh.formerSelves);
-    for (const f of sh.formerSelves) {
-      appendAudit(id, { kind: 'shed', id: f.id, weight: Number(f.weight.toFixed(3)), memoir: f.memoir });
+    // 蜕皮
+    const sh = shed(brain.persona.units, { at });
+    if (sh.formerSelves.length) {
+      brain.persona.units = sh.units;
+      brain.memory.formerSelves.push(...sh.formerSelves);
+      for (const f of sh.formerSelves) {
+        appendAudit(id, { kind: 'shed', id: f.id, weight: Number(f.weight.toFixed(3)), memoir: f.memoir });
+      }
+    }
+  }
+
+  // 带情绪的事件：先让她有感受，再记下来。
+  // 否则 episode 记的是"这件事之前"的心情，日记里就变成时间错位。
+  if (doRemember && Number.isFinite(Number(ev.valence))) {
+    try {
+      feel(id, {
+        valence: Math.max(-1, Math.min(1, Number(ev.valence))),
+        intensity: Number.isFinite(Number(ev.intensity)) ? Math.max(0, Math.min(1, Number(ev.intensity))) : 0.5,
+        what: ev.what ?? ev.text ?? '',
+      });
+    } catch (e) {
+      logOnce(`[brain] 事件自带情绪但算失败（已忽略）：${e?.message ?? e}`);
     }
   }
 
@@ -241,7 +397,7 @@ export function observe(id = DEFAULT_ID, event = {}) {
   const obs = ev.what
     ? ev
     : (ev.text ? { who: ev.who ?? ev.sender ?? '', what: String(ev.text).slice(0, 80), feel: ev.feel ?? '', via: ev.via ?? 'api' } : null);
-  if (obs?.what) {
+  if (doRemember && obs?.what) {
     addEpisode(brain.memory, {
       who: obs.who ?? '',
       what: obs.what,
@@ -252,10 +408,11 @@ export function observe(id = DEFAULT_ID, event = {}) {
       context: ev.context ?? null,
       strategy: ev.action?.strategy ?? null,
       evidence: obs.via ?? 'chat',
+      source: 'live',
     }, at);
   }
 
-  if (ev.action) {
+  if (doRemember && ev.action) {
     const label = attribute(ev.action, brain.memory);
     appendAudit(id, { kind: 'attribution', label, strategy: ev.action.strategy });
     brain.meta.lastLabel = label;
@@ -266,7 +423,7 @@ export function observe(id = DEFAULT_ID, event = {}) {
   }
 
   // 平台记忆：她刷到过什么（有 app 才记）
-  if (ev.app && (ev.title || ev.text)) {
+  if (doRemember && ev.app && (ev.title || ev.text)) {
     recordSeen(brain.memory, ev.app, {
       title: ev.title ?? String(ev.text).slice(0, 60),
       kind: ev.kind ?? '',
@@ -277,18 +434,21 @@ export function observe(id = DEFAULT_ID, event = {}) {
 
     // ── 闭环：刷到的东西反过来改人设 ──
     // 看的解压视频多了，"懒"这条特质就真的涨一点；人设变了，下次爱看的就不一样。
-    const { traits: nextTraits, delta } = nudgeTraits(brain.persona.traits, ev.kind ?? '', Number(ev.reaction) || 0);
-    if (Object.keys(delta).length) {
-      brain.persona.traits = nextTraits;
-      brain.self.style = styleVector(nextTraits);
-      brain.self.styleName = dominantStyle(brain.self.style);
-      appendAudit(id, { kind: 'trait-drift', app: ev.app, contentKind: ev.kind, delta });
+    // evolve:false 时这条也关掉——只当记忆库用，就不该偷偷改人设。
+    if (doEvolve) {
+      const { traits: nextTraits, delta } = nudgeTraits(brain.persona.traits, ev.kind ?? '', Number(ev.reaction) || 0);
+      if (Object.keys(delta).length) {
+        brain.persona.traits = nextTraits;
+        brain.self.style = styleVector(nextTraits);
+        brain.self.styleName = dominantStyle(brain.self.style);
+        appendAudit(id, { kind: 'trait-drift', app: ev.app, contentKind: ev.kind, delta });
+      }
     }
   }
 
   // 关系记忆：互动次数
   const who = ev.who ?? ev.sender;
-  if (who) {
+  if (doRemember && who) {
     const im = brain.memory.impressions[who] ?? { traits: [], count: 0, lastAt: at };
     im.count += 1;
     im.lastAt = at;
@@ -300,7 +460,7 @@ export function observe(id = DEFAULT_ID, event = {}) {
   brain.meta.lastObservationAt = at;
   refreshBrief(brain);
   saveBrain(brain);
-  return { brain, consistent, conflicting, label: brain.meta.lastLabel };
+  return { brain, consistent, conflicting, label: brain.meta.lastLabel, evolved: doEvolve, remembered: doRemember };
 }
 
 /** 关键词匹配：粗但确定（中文按二元组）。 */
@@ -338,12 +498,132 @@ export function settleBrain(id = DEFAULT_ID, now = nowMs()) {
       brain.persona.units = sh.units;
       brain.memory.formerSelves.push(...sh.formerSelves);
     }
-    settle(brain.memory, now);
+
+    if (ttlPolicy === 'summarize' || ttlPolicy === 'archive') {
+      // 过期前先压一张卡片——"忘了细节，但记得大概"
+      const card = makeCard(brain.memory.episodes.slice(-12));
+      if (card) addCard(brain.memory, card);
+    }
+
+    const before = brain.memory.forgotten.length;
+    if (ttlPolicy !== 'off') settle(brain.memory, now);
+
+    // archive：过期的不算真丢，摊到 archive.jsonl 里备查，免得 brain.json 越滚越大
+    if (ttlPolicy === 'archive' && brain.memory.forgotten.length > before) {
+      try {
+        const newly = brain.memory.forgotten.slice(before);
+        fs.appendFileSync(
+          path.join(brainDir(id), 'archive.jsonl'),
+          `${newly.map((x) => JSON.stringify(x)).join('\n')}\n`,
+          'utf8',
+        );
+      } catch (e) {
+        logOnce(`[brain] 归档写入失败（已忽略）：${e?.message ?? e}`);
+      }
+    }
+    if (brain.memory.forgotten.length > 500) {
+      brain.memory.forgotten = brain.memory.forgotten.slice(-500);
+    }
+
     brain.meta.lastSettle = now;
     refreshBrief(brain);
     saveBrain(brain);
   }
   return brain;
+}
+
+/* ── 快照 / 回滚 ─────────────────────────────────────────────── */
+
+/** 给现在的她存个档，坏了能退回来。 */
+export function snapshotBrain(id = DEFAULT_ID, name = '') {
+  const brain = ensureBrain(id);
+  const dir = path.join(brainDir(id), 'snapshots');
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const file = path.join(dir, `${name || stamp}.json`);
+  fs.writeFileSync(file, JSON.stringify(brain, null, 2), 'utf8');
+  appendAudit(id, { kind: 'snapshot', name: path.basename(file, '.json') });
+  return { ok: true, name: path.basename(file, '.json'), file };
+}
+
+/** 退回到某个快照。权重逐条还原。 */
+export function restoreBrain(id = DEFAULT_ID, name = '') {
+  if (!name) return { ok: false, reason: '要说退回到哪个快照' };
+  const dir = path.join(brainDir(id), 'snapshots');
+  const file = name.endsWith('.json') ? path.join(dir, name) : path.join(dir, `${name}.json`);
+  if (!fs.existsSync(file)) {
+    const list = listSnapshots(id).map((s) => s.name);
+    return { ok: false, reason: `没有这个快照：${name}`, available: list };
+  }
+  const data = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  data.id = id;
+  saveBrain(data);
+  cache.set(id, data);
+  appendAudit(id, { kind: 'restore', name });
+  return { ok: true, restored: name, check: identityCheck(id) };
+}
+
+export function listSnapshots(id = DEFAULT_ID) {
+  const dir = path.join(brainDir(id), 'snapshots');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => ({
+      name: f.replace(/\.json$/, ''),
+      size: fs.statSync(path.join(dir, f)).size,
+      at: fs.statSync(path.join(dir, f)).mtimeMs,
+    }))
+    .sort((a, b) => b.at - a.at);
+}
+
+/* ── 导入历史 ───────────────────────────────────────────────── */
+
+/**
+ * 把宿主已有的历史经历灌进来。
+ *
+ * 宿主那边往往已经有日记/经验库，不导进来就是"两套记忆各记一套"，
+ * 用户问「你记得吗」会出现两个答案。
+ *
+ * @param {Array} list [{ who, text|what, at, feel, mood, emotion }]
+ */
+export function importEpisodes(id = DEFAULT_ID, list = [], { source = 'import' } = {}) {
+  const brain = ensureBrain(id);
+  let imported = 0;
+  let skipped = 0;
+  const touched = new Map(); // who → 次数
+
+  for (const it of Array.isArray(list) ? list : []) {
+    const what = String(it?.text ?? it?.what ?? '').trim();
+    if (!what) { skipped += 1; continue; }
+    const at = Number(it?.at) || nowMs();
+    addEpisode(brain.memory, {
+      who: it.who ?? '',
+      what: what.slice(0, 140),
+      feel: it.feel ?? '',
+      mood: it.mood ?? '',
+      emotion: Number(it.emotion) || 0,
+      outcome: it.outcome ?? null,
+      context: it.context ?? null,
+      strategy: it.strategy ?? null,
+      evidence: it.via ?? source,
+      source, // live | import
+    }, at);
+    imported += 1;
+    const who = String(it.who ?? '').trim();
+    if (who) touched.set(who, (touched.get(who) ?? 0) + 1);
+  }
+
+  // 搬进来的也要"认识这个人"——否则检索里永远"还不熟"
+  for (const [who, n] of touched) {
+    const im = brain.memory.impressions[who] ?? { traits: [], count: 0, lastAt: 0 };
+    im.count += n;
+    im.lastAt = Math.max(Number(im.lastAt) || 0, nowMs());
+    brain.memory.impressions[who] = im;
+  }
+
+  saveBrain(brain);
+  appendAudit(id, { kind: 'import-episodes', imported, skipped, source, people: touched.size });
+  return { ok: true, imported, skipped, people: touched.size, total: brain.memory.episodes.length };
 }
 
 /** 记一次"想起"（续命）。 */
@@ -405,11 +685,20 @@ export function feel(id = DEFAULT_ID, event = {}, { blend = 0.65 } = {}) {
   // 情绪有余温：新感受占 65%，上一次剩 35%。
   // 否则每件事都把心情冲成新的，人会像开关而不是像有情绪惯性的活物。
   const k = Math.max(0, Math.min(1, Number(blend)));
+
+  // 双源仲裁：宿主说了算时，只算不写——免得两套情绪系统互相覆盖
+  if (moodPolicy === 'host') {
+    brain.meta.lastFeel = { at: Date.now(), pad: r.pad, label: r.label, stage: r.stage, text: r.text, applied: false };
+    saveBrain(brain);
+    return { ...r, applied: false, reason: 'moodPolicy=host，情绪以宿主为准，这里只算不写' };
+  }
+
   const prev = brain.affect ?? {};
+  const effBlend = moodPolicy === 'blend' ? Math.min(k, 0.5) : k;
   const mix = (next, before) => {
     const old = Number(before);
     const base = Number.isFinite(old) ? old : 0;
-    return Number((next * k + base * (1 - k)).toFixed(4));
+    return Number((next * effBlend + base * (1 - effBlend)).toFixed(4));
   };
 
   brain.affect = {
@@ -419,11 +708,12 @@ export function feel(id = DEFAULT_ID, event = {}, { blend = 0.65 } = {}) {
     // 名字按**这次**的感受叫：旧的余温不该拖住命名
     mood: r.label.kind === 'word' ? r.label.word : (r.label.kind === 'variant' ? `${r.label.word}（变体）` : '说不上来'),
     // 余温多少，方便调试时看"她还没缓过来"
-    carryover: Number((1 - k).toFixed(2)),
+    carryover: Number((1 - effBlend).toFixed(2)),
+    moodSource: moodPolicy,
   };
-  brain.meta.lastFeel = { at: Date.now(), pad: r.pad, blended: [brain.affect.p, brain.affect.a, brain.affect.d], label: r.label, stage: r.stage, text: r.text };
+  brain.meta.lastFeel = { at: Date.now(), pad: r.pad, blended: [brain.affect.p, brain.affect.a, brain.affect.d], label: r.label, stage: r.stage, text: r.text, applied: true };
   saveBrain(brain);
-  return { ...r, blended: [brain.affect.p, brain.affect.a, brain.affect.d] };
+  return { ...r, applied: true, blended: [brain.affect.p, brain.affect.a, brain.affect.d] };
 }
 
 /**
@@ -703,6 +993,391 @@ export function seenBefore(id = DEFAULT_ID, text = '') {
   return similarSeen(ensureBrain(id).memory, text);
 }
 
+/* ── 身份体检：换脑之后还是不是她 ─────────────────────────────── */
+
+/**
+ * 「我还是我吗」不用哲学，查三样东西在不在：
+ *   ① 记忆   跟谁发生过什么
+ *   ② 自我叙事 她以为的自己
+ *   ③ 关系   认谁、怎么称呼
+ *
+ * 三个都在 → 是她；缺一个 → 像她但不是她；全没有 → 只是同名。
+ */
+export function identityCheck(id = DEFAULT_ID) {
+  const b = ensureBrain(id);
+  const episodes = b.memory.episodes.length;
+  const people = Object.keys(b.memory.impressions ?? {}).length;
+  const cards = (b.memory.cards ?? []).length;
+  const narrative = Boolean(b.self?.narrative);
+  const relation = Boolean(b.relation?.type);
+
+  const marks = [episodes + people > 0, narrative, relation];
+  const verdict = marks.every(Boolean)
+    ? '是她'
+    : marks.some(Boolean) ? '像她，但不是她' : '同名而已';
+
+  return {
+    id,
+    memory: { episodes, people, cards },
+    narrative,
+    narrativeText: b.self?.narrative ?? '',
+    relation: relation ? { type: b.relation.type, address: b.relation.address ?? '' } : null,
+    verdict,
+  };
+}
+
+/* ── 脑包：把"她"打包带走 ────────────────────────────────────── */
+
+export const PACK_FORMAT = 'feiyu-brainpack/1';
+
+/**
+ * 导出"她"——人设 + 记忆 + 关系 + 词表 + 情绪。
+ * **换脑不是换人的前提是这个包带得走。**
+ */
+export function exportPack(id = DEFAULT_ID, { includeMemory = true } = {}) {
+  const b = ensureBrain(id);
+  return {
+    format: PACK_FORMAT,
+    exportedAt: nowMs(),
+    id: b.id,
+    born: b.born,
+    roleCard: b.roleCard,
+    persona: b.persona,
+    self: b.self,
+    relation: b.relation,
+    vocab: b.vocab ?? {},
+    affect: b.affect ?? {},
+    body: b.body ? { kind: b.body.kind, ownership: b.body.ownership } : null,
+    patience: b.patience,
+    ...(includeMemory ? { memory: b.memory } : {}),
+  };
+}
+
+/**
+ * 把包装回来。
+ *
+ * 只认 `feiyu-brainpack/1`；别的格式（aurobot / 口袋 / TavernCard）需要先写迁移器转成这个格式。
+ * 宁可拒收，也不假装兼容。
+ */
+export function importPack(pack, { id, keepMemory = true } = {}) {
+  if (!pack || pack.format !== PACK_FORMAT) {
+    return { ok: false, reason: `不是 ${PACK_FORMAT} 格式，先用迁移器转一下` };
+  }
+  const units = pack.persona?.units ?? [];
+  if (!units.length) return { ok: false, reason: '包里没有命题，导进来也是空壳' };
+
+  const targetId = id ?? pack.id ?? DEFAULT_ID;
+  const identity = units.find((u) => u.kind === 'identity')?.text ?? `你是${pack.roleCard ?? targetId}`;
+  const cardText = [identity, ...units.filter((u) => u.kind !== 'identity').map((u) => `- ${u.text}`)].join('\n');
+
+  const brain = birth({
+    id: targetId,
+    relation: pack.relation?.type ?? 'parent',
+    address: pack.relation?.address ?? '',
+    cardText,
+    cardName: pack.roleCard ?? targetId,
+  });
+
+  // 用包里的原样覆盖：保留命题 id、权重、来源——这些是"她"的部分
+  brain.persona = { ...pack.persona, brief: '' };
+  brain.self = { ...brain.self, ...(pack.self ?? {}) };
+  brain.self.style = brain.self.style ?? styleVector(brain.persona.traits);
+  brain.self.styleName = dominantStyle(brain.self.style);
+  if (pack.relation) brain.relation = pack.relation;
+  brain.vocab = pack.vocab ?? {};
+  brain.affect = pack.affect ?? brain.affect;
+  if (Number.isFinite(pack.patience)) brain.patience = pack.patience;
+  if (keepMemory && pack.memory) brain.memory = { ...emptyMemory(), ...pack.memory };
+  if (pack.body?.kind) {
+    try { brain.body = createBody({ kind: pack.body.kind, ownership: pack.body.ownership }); } catch { /* 身体坏了不影响她是谁 */ }
+  }
+  if (Number.isFinite(pack.born)) brain.born = pack.born;
+
+  refreshBrief(brain);
+  saveBrain(brain);
+  cache.set(targetId, brain);
+  appendAudit(targetId, { kind: 'import-pack', from: pack.id ?? '?', units: units.length, memory: keepMemory });
+
+  return { ok: true, id: targetId, units: units.length, check: identityCheck(targetId) };
+}
+
+/* ── 记忆搬迁：老鱼把过去搬进来 ─────────────────────────────── */
+
+/**
+ * 把宿主已有的记忆搬进脑子。
+ *
+ * 这是**有损转换**，不是复制：宿主日记是流水账，脑子里存的是"她记得的事"。
+ * 每条都标 source:'import'，将来能分清哪些是亲历、哪些是搬来的。
+ *
+ *   migrateMemory('old', { text, format: 'jsonl' })           // 真搬
+ *   migrateMemory('old', { text, format: 'days', dryRun: true }) // 只看会搬多少
+ */
+export function migrateMemory(id = DEFAULT_ID, { text = '', format = 'jsonl', dryRun = false } = {}) {
+  const brain = ensureBrain(id);
+  const parsed = parseAny(String(text ?? ''), format);
+  const d = dedupe(parsed.episodes, { existing: brain.memory.episodes });
+
+  const ats = d.episodes.map((e) => e.at).filter((t) => t > 0).sort((a, b) => a - b);
+  const report = {
+    format,
+    parsed: parsed.episodes.length,
+    duplicated: d.duplicated,
+    willImport: d.episodes.length,
+    parseErrors: parsed.errors.slice(0, 20),
+    parseErrorCount: parsed.errors.length,
+    span: ats.length ? { from: new Date(ats[0]).toISOString().slice(0, 10), to: new Date(ats[ats.length - 1]).toISOString().slice(0, 10) } : null,
+  };
+
+  if (dryRun) return { ok: true, dryRun: true, report };
+
+  const r = importEpisodes(id, d.episodes, { source: 'import' });
+  return { ok: true, dryRun: false, report, imported: r.imported, total: r.total };
+}
+
+/** 读归档（过期但没丢的那些） */
+export function readArchive(id = DEFAULT_ID, limit = 20) {
+  const file = path.join(brainDir(id), 'archive.jsonl');
+  if (!fs.existsSync(file)) return [];
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean);
+  return lines.slice(-limit).map((l) => {
+    try { return JSON.parse(l); } catch { return { raw: l }; }
+  });
+}
+
+/* ── 全量整合：把宿主所有记忆并成一份 ───────────────────────── */
+
+/** 脑里最多存多少条经历，超了自动压卡片 + 归档（防止 brain.json 无限膨胀） */
+export const MAX_EPISODES = 5000;
+
+/**
+ * 容量保护：最老的一批压成卡片，原文进 archive.jsonl。
+ * 只留最近 MAX_EPISODES 条在检索池里——不变大，也不真丢。
+ */
+function enforceCapacity(brain) {
+  const eps = brain.memory.episodes;
+  if (eps.length <= MAX_EPISODES) return { compacted: 0 };
+  const overflow = eps.length - MAX_EPISODES;
+  const take = Math.min(overflow + 200, eps.length); // 一次多挤一点，别每条都触发
+  const oldest = eps.slice(0, take);
+  const card = makeCard(oldest);
+  if (card) addCard(brain.memory, card);
+  try {
+    fs.appendFileSync(
+      path.join(brainDir(brain.id), 'archive.jsonl'),
+      `${oldest.map((x) => JSON.stringify(x)).join('\n')}\n`,
+      'utf8',
+    );
+  } catch (e) {
+    logOnce(`[brain] 容量归档失败（已忽略）：${e?.message ?? e}`);
+  }
+  brain.memory.episodes = eps.slice(take);
+  appendAudit(brain.id, { kind: 'capacity', compacted: take });
+  return { compacted: take, card: card?.id ?? null };
+}
+
+/**
+ * 把多份记忆一次性并进来。**这是"只剩一份记忆"的唯一入口。**
+ *
+ * @param {Array} sources [{ path, text, format }]
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun]       只算不写
+ * @param {boolean} [opts.deleteSource] 搬完把原文件改名成 .migrated（不是删除，留后悔药）
+ */
+export function migrateAll(id = DEFAULT_ID, sources = [], { dryRun = false, deleteSource = false } = {}) {
+  const brain = ensureBrain(id);
+  const all = [];
+  const errors = [];
+  const files = [];
+
+  for (const s of Array.isArray(sources) ? sources : []) {
+    if (!s?.text) continue;
+    files.push(s.path ?? '(inline)');
+    const r = parseAny(String(s.text), s.format ?? 'jsonl');
+    all.push(...r.episodes);
+    for (const e of r.errors.slice(0, 3)) errors.push({ path: s.path ?? '', ...e });
+  }
+
+  const d = dedupe(all, { existing: brain.memory.episodes });
+  const ats = d.episodes.map((e) => e.at).filter((t) => t > 0).sort((a, b) => a - b);
+  const report = {
+    files: files.length,
+    parsed: all.length,
+    duplicated: d.duplicated,
+    willImport: d.episodes.length,
+    errors: errors.slice(0, 20),
+    errorCount: errors.length,
+    span: ats.length ? { from: new Date(ats[0]).toISOString().slice(0, 10), to: new Date(ats[ats.length - 1]).toISOString().slice(0, 10) } : null,
+  };
+
+  if (dryRun) return { ok: true, dryRun: true, report };
+
+  const r = importEpisodes(id, d.episodes, { source: 'import' });
+  const cap = enforceCapacity(brain);
+
+  // 原始文件不 rm，改名 —— 用户要删自己删，别让我们替他做不可逆的事
+  const renamed = [];
+  if (deleteSource) {
+    for (const p of files) {
+      if (!p || p === '(inline)' || !fs.existsSync(p)) continue;
+      try {
+        fs.renameSync(p, `${p}.migrated`);
+        renamed.push(`${p}.migrated`);
+      } catch (e) {
+        errors.push({ path: p, reason: `改名失败：${e?.message ?? e}` });
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    dryRun: false,
+    report,
+    imported: r.imported,
+    total: r.total,
+    compacted: cap.compacted,
+    renamed,
+    check: identityCheck(id),
+  };
+}
+
+/** 迁完之后的自检：搬进来的东西到底能不能被想起来 */
+export function verifyMemory(id = DEFAULT_ID, { samples = 5 } = {}) {
+  const brain = ensureBrain(id);
+  const eps = brain.memory.episodes;
+  const imported = eps.filter((e) => e.source === 'import').length;
+  const live = eps.filter((e) => e.source === 'live').length;
+
+  const picked = eps.filter((e) => e.what).slice(-samples);
+  const checks = picked.map((e) => {
+    const kw = String(e.what).slice(0, 6);
+    const line = wakeLine(id, { who: e.who ?? '', text: kw });
+    return { keyword: kw, found: line.includes(kw.slice(0, 3)) };
+  });
+
+  return {
+    id,
+    episodes: eps.length,
+    imported,
+    live,
+    cards: (brain.memory.cards ?? []).length,
+    people: Object.keys(brain.memory.impressions ?? {}).length,
+    check: identityCheck(id),
+    recall: checks,
+    recallRate: checks.length ? checks.filter((c) => c.found).length / checks.length : 1,
+  };
+}
+
+/* ── 日记：她自己的心房 ─────────────────────────────────────── */
+
+/** 日记目录：<dataDir>/days/，跟宿主自己的日记分开，别互相覆盖 */
+export function diaryDir(id = DEFAULT_ID) {
+  return path.join(brainDir(id), 'days');
+}
+
+export function diaryPath(id = DEFAULT_ID, date = '') {
+  const d = date || dayKey();
+  return path.join(diaryDir(id), `${d}.md`);
+}
+
+/**
+ * 今天的素材 + 第一人称骨架。
+ * 脑子不出文笔，只给料——宿主拿 draft 让模型用她的口吻写成日记。
+ */
+export function diaryDigest(id = DEFAULT_ID, date = '') {
+  const brain = ensureBrain(id);
+  return dayDigest(brain, date || dayKey());
+}
+
+/**
+ * 她把日记存回来。
+ *
+ * 存完之后这段文字会被当作"她写过的"记进记忆——将来问"你写过什么"能想起来。
+ * **日记要带心情**：正文里没写就补一行（`withMood:false` 可关掉）。
+ */
+export function writeDiary(id = DEFAULT_ID, { date = '', text = '', withMood = true } = {}) {
+  const brain = ensureBrain(id);
+  const body = String(text ?? '').trim();
+  if (!body) return { ok: false, reason: '日记是空的' };
+
+  const d = date || dayKey();
+  const mood = brain.affect?.mood ?? '';
+  const hasMood = mood && mood !== '平静' && mood !== '说不上来';
+
+  // 她自己写了心情就不动；没写就补一行，别让日记丢了心情
+  let final = body;
+  let moodAdded = false;
+  if (withMood && hasMood && !/心情/.test(final)) {
+    final = `${final}\n\n心情：${mood}`;
+    moodAdded = true;
+  }
+
+  const dir = diaryDir(id);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = diaryPath(id, d);
+  fs.writeFileSync(file, final.endsWith('\n') ? final : `${final}\n`, 'utf8');
+
+  // 记进记忆：以后能想起来"我写过什么"
+  addEpisode(brain.memory, {
+    who: '',
+    what: `我写了日记：${final.replace(/\s+/g, ' ').slice(0, 60)}`,
+    feel: hasMood ? mood : '',
+    mood: hasMood ? mood : '',
+    source: 'diary',
+    evidence: file,
+  }, nowMs());
+
+  if (!Array.isArray(brain.meta.diary)) brain.meta.diary = [];
+  if (!brain.meta.diary.includes(d)) brain.meta.diary.push(d);
+  brain.meta.diary = brain.meta.diary.slice(-400);
+
+  // 心情单独存一份，方便按月看她的情绪曲线
+  if (!brain.meta.diaryMood) brain.meta.diaryMood = {};
+  brain.meta.diaryMood[d] = hasMood ? mood : '';
+
+  saveBrain(brain);
+  appendAudit(id, { kind: 'diary', date: d, chars: final.length, mood: brain.meta.diaryMood[d], moodAdded });
+  return { ok: true, date: d, file, chars: final.length, mood: brain.meta.diaryMood[d] || null, moodAdded };
+}
+
+export function readDiary(id = DEFAULT_ID, date = '') {
+  const file = diaryPath(id, date);
+  if (!fs.existsSync(file)) return null;
+  const brain = ensureBrain(id);
+  const d = path.basename(file, '.md');
+  return {
+    date: d,
+    text: fs.readFileSync(file, 'utf8'),
+    mood: brain.meta.diaryMood?.[d] ?? null,
+  };
+}
+
+export function listDiary(id = DEFAULT_ID) {
+  const dir = diaryDir(id);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.md'))
+    .map((f) => {
+      const full = path.join(dir, f);
+      return { date: f.replace(/\.md$/, ''), size: fs.statSync(full).size, at: fs.statSync(full).mtimeMs };
+    })
+    .sort((a, b) => (a.date < b.date ? 1 : -1));
+}
+
+/** 日记也能被检索：问"你写过什么"时用它 */
+export function recallDiary(id = DEFAULT_ID, word = '', { limit = 3 } = {}) {
+  const list = listDiary(id);
+  if (!list.length) return [];
+  const q = String(word ?? '').trim();
+  const hits = [];
+  for (const d of list) {
+    const r = readDiary(id, d.date);
+    if (!r) continue;
+    if (!q || r.text.includes(q)) hits.push({ date: r.date, excerpt: r.text.replace(/\s+/g, ' ').slice(0, 80) });
+    if (hits.length >= limit) break;
+  }
+  return hits;
+}
+
 export function snapshot(id = DEFAULT_ID) {
   const brain = ensureBrain(id);
   const level = flowLevel(brain.state, { boredom: brain.drive.boredom });
@@ -730,8 +1405,18 @@ export function snapshot(id = DEFAULT_ID) {
     relation: brain.relation,
     weights: weightReport(brain.persona.units),
     personaSource: brain.persona.source ?? null,
-    apps: appSummary(brain.memory),
+    apps: appSummary(brain.memory, brain.persona.traits),
     affect: brain.affect,
+    runtime: {
+      shadow: Boolean(shadowMode || brain.meta.shadow),
+      ttlPolicy,
+      moodPolicy,
+      dataDir: dataDir(),
+      dataDirSource: dataDirSource(),
+      dataDirInsidePackage: isDataDirInsidePackage(),
+      roleDir: roleDir(),
+    },
+    contractWarnings: brain.meta.contractWarnings ?? [],
     emotion: {
       stage: emotion.stageOf(brain.vocab),
       words: Object.keys(brain.vocab),
@@ -779,7 +1464,12 @@ export function forgetCache(id) {
  *   fy.tick()
  */
 export function createBrain(options = {}) {
-  configure({ dataDir: options.dataDir, roleDir: options.roleDir });
+  configure({
+    dataDir: options.dataDir,
+    roleDir: options.roleDir,
+    shadow: options.shadow,
+    ttl: options.ttlPolicy,
+  });
   const id = options.id ?? DEFAULT_ID;
 
   // 第一次建这条鱼时，把关系和称呼一起落进去——
@@ -800,11 +1490,26 @@ export function createBrain(options = {}) {
   return {
     id,
     get brain() { return ensureBrain(id); },
-    wake(event) {
+    wake(event, opts) {
       if (shouldObserve(event)) observe(id, event);
-      return { text: wakeLine(id, event), id };
+      return { text: wakeLine(id, event, opts), id };
     },
-    observe(event) { return observe(id, event); },
+    observe(event, opts) { return observe(id, event, opts); },
+    /** 「我还是我吗」三件套体检 */
+    identity() { return identityCheck(id); },
+    /** 打包带走 */
+    exportPack(opts) { return exportPack(id, opts); },
+    /** 存档 / 回滚 */
+    snapshot(name) { return snapshotBrain(id, name); },
+    restore(name) { return restoreBrain(id, name); },
+    snapshots() { return listSnapshots(id); },
+    /** 把宿主已有的历史灌进来 */
+    importEpisodes(list, opts) { return importEpisodes(id, list, opts); },
+    /** 日记：她的心房 */
+    diary(date) { return diaryDigest(id, date); },
+    writeDiary(opts) { return writeDiary(id, opts); },
+    readDiary(date) { return readDiary(id, date); },
+    listDiary() { return listDiary(id); },
     tick(now) { return settleBrain(id, now); },
     brief() { return getBrief(id); },
     snapshot() { return snapshot(id); },
@@ -853,6 +1558,9 @@ export { retrieve } from './core/memory.js';
 export { brief } from './core/persona.js';
 export { normalizeEvent, toCue, toObservation, shouldObserve, keywords } from './core/event.js';
 export { dataDir, roleDir } from './store.js';
+export { dataDirSource, isDataDirInsidePackage } from './store.js';
+export { lintCard } from './core/extract.js';
+export { dedupeKey } from './adapters/qq-bridge.js';
 export { createBridgeAdapter } from './adapters/qq-bridge.js';
 export {
   createBody, chooseBody, bodyScores, bodyLine, canDo, hasCapability,

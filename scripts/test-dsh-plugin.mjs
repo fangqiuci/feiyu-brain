@@ -59,13 +59,16 @@ t('仍然 re-export 了库 API（两种用法共用一个包）', () => {
 
 mod.apply(ctx, { brainId: 'dsh', dataDir: tmp, roleDir: roles });
 
-t('注册了 6 个工具', () => {
-  if (tools.length !== 6) throw new Error(`实际 ${tools.length} 个：${tools.map((x) => x.name).join(',')}`);
+t('注册了 9 个工具', () => {
+  if (tools.length !== 9) throw new Error(`实际 ${tools.length} 个：${tools.map((x) => x.name).join(',')}`);
 });
 
 t('工具名符合约定', () => {
   const names = tools.map((x) => x.name).sort().join(',');
-  const want = ['feiyu_app', 'feiyu_feel', 'feiyu_observe', 'feiyu_status', 'feiyu_tick', 'feiyu_wake'].join(',');
+  const want = [
+    'feiyu_app', 'feiyu_diary', 'feiyu_feel', 'feiyu_lint', 'feiyu_observe',
+    'feiyu_snapshot', 'feiyu_status', 'feiyu_tick', 'feiyu_wake',
+  ].join(',');
   if (names !== want) throw new Error(names);
 });
 
@@ -141,6 +144,38 @@ await ta('feiyu_app 卸载要过闸门', async () => {
   const r = await byName.feiyu_app.execute({ action: 'uninstall', package: 'com.x' });
   if (r.ok !== false) throw new Error('竟然删了');
   if (!['E_NOT_YET', 'Q1', 'E_NO_DEVICE'].includes(r.code)) throw new Error(`意外的 code ${r.code}`);
+});
+
+console.log('\n── 工具可按需注册（不想要那只手就别给）──');
+
+await ta('config.tools 只给 status → 只注册 1 个', async () => {
+  const picked = [];
+  const miniCtx = { tools: { register: (spec) => { picked.push(spec); return spec; } } };
+  mod.apply(miniCtx, { brainId: 'dsh', dataDir: tmp, roleDir: roles, tools: ['status'] });
+  if (picked.length !== 1) throw new Error(`注册了 ${picked.length} 个：${picked.map((x) => x.name).join(',')}`);
+  if (picked[0].name !== 'feiyu_status') throw new Error(picked[0].name);
+});
+
+await ta('不给 app → 不会多出一只开 App 的手', async () => {
+  const picked = [];
+  const miniCtx = { tools: { register: (spec) => { picked.push(spec); return spec; } } };
+  mod.apply(miniCtx, { brainId: 'dsh', dataDir: tmp, roleDir: roles, tools: ['status', 'wake', 'observe', 'tick'] });
+  if (picked.length !== 4) throw new Error(`注册了 ${picked.length} 个`);
+  if (picked.some((x) => x.name === 'feiyu_app')) throw new Error('居然还在');
+});
+
+await ta('feiyu_wake 支持只点 mood', async () => {
+  const r = await byName.feiyu_wake.execute({ sender: 'A', sections: 'mood' });
+  if (!r.ok) throw new Error(r.text);
+  if (r.text.includes('【此刻的她】')) throw new Error('还是给了人设段');
+});
+
+await ta('feiyu_observe 传 evolve:false 不动权重', async () => {
+  const before = mod.snapshot('dsh').weights.totalWeight;
+  const r = await byName.feiyu_observe.execute({ who: 'A', text: '我嘴硬，被怼会顶回去', evolve: false });
+  if (!r.ok) throw new Error(r.text);
+  if (!/没动/.test(r.text)) throw new Error(r.text);
+  if (mod.snapshot('dsh').weights.totalWeight !== before) throw new Error('权重变了');
 });
 
 console.log('');

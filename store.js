@@ -1,9 +1,10 @@
 // 落盘：<dataDir>/brains/<id>/ 下的一组 JSON。
 //
 // 发布成包之后，路径不能写死到仓库里——宿主可能是任意目录。
-// 优先级：setDataDir() > 环境变量 FEIYU_DATA_DIR > 包所在仓库的 state/
+// 优先级：setDataDir() > 环境变量 FEIYU_DATA_DIR > 用户目录（装进 node_modules 时）> 仓库 state/
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,13 +13,29 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** 包所在仓库根（老用法：桥接同目录）。发布后可能指向 node_modules，只作兜底。 */
 export const ROOT = path.resolve(HERE, '..', '..');
 
+/**
+ * 装进 node_modules 时，ROOT 会指到 node_modules 里面——
+ * 数据写进去等于：升级/重装就丢，而且常常是只读。
+ * 这时改用用户目录。仓库内开发（不在 node_modules 里）保持原行为。
+ */
+const IN_NODE_MODULES = /[\\/]node_modules[\\/]/.test(ROOT);
+const USER_FALLBACK = path.join(os.homedir(), '.feiyu-brain');
+
+function defaultDataRoot() {
+  return IN_NODE_MODULES ? path.join(USER_FALLBACK, 'state') : path.join(ROOT, 'state');
+}
+
+function defaultRoleRoot() {
+  return IN_NODE_MODULES ? path.join(USER_FALLBACK, 'roles') : path.join(ROOT, 'roles');
+}
+
 let dataRoot = process.env.FEIYU_DATA_DIR
   ? path.resolve(process.env.FEIYU_DATA_DIR)
-  : path.join(ROOT, 'state');
+  : defaultDataRoot();
 
 let roleRoot = process.env.FEIYU_ROLE_DIR
   ? path.resolve(process.env.FEIYU_ROLE_DIR)
-  : path.join(ROOT, 'roles');
+  : defaultRoleRoot();
 
 /** 宿主指定数据目录（推荐显式设置，别依赖包位置）。 */
 export function setDataDir(dir) {
@@ -27,6 +44,17 @@ export function setDataDir(dir) {
 
 export function dataDir() {
   return dataRoot;
+}
+
+/** 数据目录是从哪来的：env / explicit / default */
+export function dataDirSource() {
+  if (process.env.FEIYU_DATA_DIR) return 'env:FEIYU_DATA_DIR';
+  return IN_NODE_MODULES ? 'default:user-home' : 'default:repo';
+}
+
+/** 装进 node_modules 且在写包里——这是要报警的情况 */
+export function isDataDirInsidePackage() {
+  return IN_NODE_MODULES && dataRoot.startsWith(ROOT + path.sep);
 }
 
 /** 宿主指定角色卡目录（roles/<名字>.md）。 */

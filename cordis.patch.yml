@@ -13,7 +13,25 @@
       name: feiyu-brain
       config:
         brainId: default
-        # 她的档案放哪（留空 = 包同级的 state/，或环境变量 FEIYU_DATA_DIR）
+
+        # 她的档案放哪。
+        # 留空 = 环境变量 FEIYU_DATA_DIR；再没有就按包位置推——
+        #   仓库内开发 → <仓库>/state
+        #   装进 node_modules → 用户目录 ~/.feiyu-brain/state（不会写进只读的包目录）
         dataDir: ""
-        # 角色卡目录（里面放 <名字>.md；留空 = 包同级的 roles/，或 FEIYU_ROLE_DIR）
+
+        # 角色卡目录（里面放 <名字>.md）。留空规则同上，落 ~/.feiyu-brain/roles。
         roleDir: ""
+
+        # 只注册你要的工具。不写 = 全注册（8 个）。
+        # 例：只要脑子不要那只开 App 的手 → [status, wake, observe, tick, feel, lint]
+        # tools: [status, wake, observe, tick]
+
+        # 影子模式：只写审计，不动人设、不落盘。想先看"会长成什么样"再决定接不接，用它。
+        shadow: false
+
+        # 遗忘策略：hard（默认，30 天到点就忘）| summarize（忘之前压成卡片）| archive（压卡片 + 原文进归档）| off（永不遗忘）
+        ttlPolicy: hard
+
+        # 情绪双源仲裁：brain（脑说了算）| host（宿主说了算，feel 只算不写）| blend（各一半）
+        moodPolicy: brain

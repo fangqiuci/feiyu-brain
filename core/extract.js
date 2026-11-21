@@ -108,20 +108,24 @@ export function plainText(t) {
  *   preference 0.70
  *   其余        0.60  → 靠经历慢慢涨落
  */
-export function extractUnits(cardText, { max = 200 } = {}) {
+export function extractUnits(cardText, { max = 200, log = null } = {}) {
   const lines = cardText.split(/\r?\n/);
   const units = [];
   let section = '';
   let sectionSkipped = false;
 
+  const drop = (raw, reason) => {
+    if (log) log({ kept: false, reason, section, text: plainText(raw) });
+  };
+
   const push = (raw, kind, weight) => {
     const t = plainText(raw);
-    if (t.length < 5 || t.length > 140) return;
-    if (/^(例如|比如|例子)/.test(t)) return;
-    if (META_RE.test(t)) return;
+    if (t.length < 5 || t.length > 140) { drop(raw, 'too-short-or-long'); return; }
+    if (/^(例如|比如|例子)/.test(t)) { drop(raw, 'example'); return; }
+    if (META_RE.test(t)) { drop(raw, 'meta'); return; }
     // `性格：嘴硬=0.9` 是给解析器的指令，不是她的一条人格
-    if (/^(?:性格|特质|traits)\s*[:：]/i.test(t)) return;
-    if (units.length >= max) return;
+    if (/^(?:性格|特质|traits)\s*[:：]/i.test(t)) { drop(raw, 'trait-hint'); return; }
+    if (units.length >= max) { drop(raw, 'over-max'); return; }
     units.push({
       id: `u${String(units.length + 1).padStart(3, '0')}`,
       text: t,
@@ -131,6 +135,7 @@ export function extractUnits(cardText, { max = 200 } = {}) {
       lastTouched: 0,
       section,
     });
+    if (log) log({ kept: true, kind, weight, section, text: t });
   };
 
   for (const rawLine of lines) {
@@ -138,15 +143,16 @@ export function extractUnits(cardText, { max = 200 } = {}) {
     const line = rawLine.trim();
     if (!line) continue;
     // 缩进的子项是"例子"，不是"命题"（梗列表、示范句都在这一层）
-    if (indent >= 2) continue;
+    if (indent >= 2) { drop(line, 'indented'); continue; }
 
     const heading = /^##\s+(.+)$/.exec(line);
     if (heading) {
       section = plainText(heading[1]);
       sectionSkipped = SKIP_SECTIONS.some((re) => re.test(section));
+      if (log) log({ kept: false, reason: 'heading', section, text: section });
       continue;
     }
-    if (sectionSkipped) continue;
+    if (sectionSkipped) { drop(line, 'skipped-section'); continue; }
 
     let text = null;
     const bullet = /^[-*]\s+(.+)$/.exec(line);
@@ -159,11 +165,12 @@ export function extractUnits(cardText, { max = 200 } = {}) {
       // 普通段落也算命题；但太短的行多半是标题或噪音。
       // 例外：以"你是/我叫/本体是"开头的短句就是身份，不能因为短就丢。
       if (line.length >= 8 || IDENTITY_RE.test(line)) text = line;
+      else { drop(line, 'too-short-line'); continue; }
     }
-    if (!text) continue;
+    if (!text) { drop(line, 'heading-ish'); continue; }
 
     // 「你不要：xxx」这种是反例，不是她
-    if (/^(你不要|也不要|你可以|或者：)/.test(text)) continue;
+    if (/^(你不要|也不要|你可以|或者：)/.test(text)) { drop(text, 'counter-example'); continue; }
 
     const clean = plainText(text);
     let kind = 'trait';
@@ -182,6 +189,38 @@ export function extractUnits(cardText, { max = 200 } = {}) {
   }
 
   return units;
+}
+
+/**
+ * 卡体检：告诉你这份卡会被怎么读。
+ *
+ * 真实用户的卡往往是「人设 + 工具说明 + 红线 + 语气规则」混在一份 md 里，
+ * 抽命题时会把"怎么调用 doubao_style_lock"也抽成"她是谁"。
+ * 这个函数不猜，只如实分类，然后把该拆出去的段落指出来。
+ */
+export function lintCard(cardText) {
+  const trace = [];
+  const units = extractUnits(cardText, { log: (l) => trace.push(l) });
+
+  const kept = trace.filter((l) => l.kept);
+  const dropped = trace.filter((l) => !l.kept);
+
+  // 像"操作手册"的行：讲工具、参数、步骤、调用
+  const OPS_RE = /(工具|参数|调用|返回值|命令|步骤|流程|接口|配置|json|yaml|npm|dsh |插件|安装|路径|http|api|shell|脚本|报错|日志)/i;
+  const opsLines = kept.filter((l) => OPS_RE.test(l.text));
+  const opsSections = [...new Set(opsLines.map((l) => l.section).filter(Boolean))];
+
+  return {
+    units: units.length,
+    byKind: units.reduce((acc, u) => { acc[u.kind] = (acc[u.kind] ?? 0) + 1; return acc; }, {}),
+    kept: kept.map((l) => ({ text: l.text, kind: l.kind, section: l.section })),
+    dropped: dropped.map((l) => ({ text: l.text.slice(0, 60), reason: l.reason })),
+    /** 这些行更像"操作手册"，建议拆到单独文件，别留在人设里 */
+    suggestSplit: opsLines.map((l) => ({ text: l.text.slice(0, 80), section: l.section })),
+    suggestSplitSections: opsSections,
+    /** 命题预览：抽完之后她到底"是谁" */
+    preview: units.slice(0, 20).map((u) => `${u.id} [${u.kind}] ${u.text}`),
+  };
 }
 
 /**
